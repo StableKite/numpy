@@ -5,6 +5,7 @@
 #include <Python.h>
 
 #include "common.h"
+#include "module_state.h"
 #include "vdot.h"
 #include "npy_cblas.h"
 

@@ -18,6 +18,8 @@
 
 #include "blas_utils.h"
 #include "npy_cblas.h"
+#include "npy_static_data.h"
+#include "module_state.h"
 #include "arraytypes.h" /* For TYPE_dot functions */
 
 #include <assert.h>

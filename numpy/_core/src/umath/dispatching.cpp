@@ -47,6 +47,7 @@
 #include "npy_import.h"
 #include "common.h"
 #include "npy_pycompat.h"
+#include "module_state.h"
 
 #include "arrayobject.h"
 #include "dispatching.h"
@@ -209,22 +210,23 @@ PyUFunc_AddLoopsFromSpecs(PyUFunc_LoopSlot *slots)
 {
     int ret = -1;
     PyObject *ufunc = NULL;
+    npy_interned_str_struct *interned_str = &_npy_module_state->interned_str;
 
     PyUFunc_LoopSlot *slot;
     for (slot = slots; slot->name != NULL; slot++) {
         // Hardcode slot names for attributes and non-ufuncs stored on the DType
         // (Also avoids circular imports a bit.)
         if (strcmp(slot->name, "real") == 0) {
-            Py_XSETREF(ufunc, Py_NewRef(npy_interned_str.real));
+            Py_XSETREF(ufunc, Py_NewRef(interned_str->real));
         }
         else if (strcmp(slot->name, "imag") == 0) {
-            Py_XSETREF(ufunc, Py_NewRef(npy_interned_str.imag));
+            Py_XSETREF(ufunc, Py_NewRef(interned_str->imag));
         }
         else if (strcmp(slot->name, "sort") == 0) {
-            Py_XSETREF(ufunc, Py_NewRef(npy_interned_str.sort));
+            Py_XSETREF(ufunc, Py_NewRef(interned_str->sort));
         }
         else if (strcmp(slot->name, "argsort") == 0) {
-            Py_XSETREF(ufunc, Py_NewRef(npy_interned_str.argsort));
+            Py_XSETREF(ufunc, Py_NewRef(interned_str->argsort));
         }
         else {
             Py_XSETREF(ufunc, npy_import_entry_point(slot->name));
@@ -233,22 +235,22 @@ PyUFunc_AddLoopsFromSpecs(PyUFunc_LoopSlot *slots)
             }
         }
 
-        if (ufunc == npy_interned_str.real) {
+        if (ufunc == interned_str->real) {
             if (set_static_method<&NPY_DType_Slots::real_meth, true>(slot->spec) < 0) {
                 goto finish;
             }
         }
-        else if (ufunc == npy_interned_str.imag) {
+        else if (ufunc == interned_str->imag) {
             if (set_static_method<&NPY_DType_Slots::imag_meth, true>(slot->spec) < 0) {
                 goto finish;
             }
         }
-        else if (ufunc == npy_interned_str.sort) {
+        else if (ufunc == _npy_module_state->interned_str.sort) {
             if (set_static_method<&NPY_DType_Slots::sort_meth, false>(slot->spec) < 0) {
                 goto finish;
             }
         }
-        else if (ufunc == npy_interned_str.argsort) {
+        else if (ufunc == _npy_module_state->interned_str.argsort) {
             if (set_static_method<&NPY_DType_Slots::argsort_meth, false>(slot->spec) < 0) {
                 goto finish;
             }
@@ -1147,7 +1149,7 @@ promote_and_get_ufuncimpl(PyUFuncObject *ufunc,
      * then we chain it, because DTypePromotionError effectively means that there
      * is no loop available.  (We failed finding a loop by using promotion.)
      */
-    else if (PyErr_ExceptionMatches(npy_static_pydata.DTypePromotionError)) {
+    else if (PyErr_ExceptionMatches(_npy_module_state->static_pydata.DTypePromotionError)) {
         PyObject *err_type = NULL, *err_value = NULL, *err_traceback = NULL;
         PyErr_Fetch(&err_type, &err_value, &err_traceback);
         raise_no_loop_found_error(ufunc, (PyObject **)op_dtypes);

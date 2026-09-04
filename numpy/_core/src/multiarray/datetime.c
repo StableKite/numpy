@@ -16,7 +16,10 @@
 #include "numpyos.h"
 
 #include "npy_config.h"
-
+#include "npy_pycompat.h"  // PyObject_GetOptionalAttr
+#include "npy_static_data.h"
+#include "module_state.h"
+#include "numpy/npy_math.h"
 
 #include "common.h"
 #include "numpy/arrayscalars.h"
@@ -2086,6 +2089,7 @@ NpyDatetime_ConvertPyDateTimeToDatetimeStruct(
         PyObject *obj, npy_datetimestruct *out, NPY_DATETIMEUNIT *out_bestunit,
         int apply_tzinfo)
 {
+    multiarray_umath_state *state = _npy_module_state;
     PyObject *tmp;
     int isleap;
 

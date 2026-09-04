@@ -22,6 +22,7 @@
 #include "convert_datatype.h"
 #include "descriptor.h"
 #include "npy_static_data.h"
+#include "module_state.h"
 #include "ctors.h"
 
 #include "npy_config.h"
@@ -185,14 +186,15 @@ typedef enum {
 static int
 pyscalar_mode_conv(PyObject *obj, scalar_policy *policy)
 {
+    npy_interned_str_struct *interned_str = &_npy_module_state->interned_str;
     if (!PyUnicode_Check(obj)) {
         PyErr_Format(PyExc_TypeError,
                 "invalid pyscalar mode %.100R, must be a string", obj);
         return 0;
     }
     PyObject *strings[3] = {
-            npy_interned_str.convert, npy_interned_str.preserve,
-            npy_interned_str.convert_if_no_array};
+            interned_str->convert, interned_str->preserve,
+            interned_str->convert_if_no_array};
 
     /* First quick pass using the identity (should practically always match) */
     for (int i = 0; i < 3; i++) {

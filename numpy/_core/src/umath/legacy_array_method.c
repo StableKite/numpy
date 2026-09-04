@@ -17,6 +17,8 @@
 #include "dtype_transfer.h"
 #include "legacy_array_method.h"
 #include "dtypemeta.h"
+#include "npy_static_data.h"
+#include "module_state.h"
 
 #include "ufunc_object.h"
 #include "ufunc_type_resolution.h"

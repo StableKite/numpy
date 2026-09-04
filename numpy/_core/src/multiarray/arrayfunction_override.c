@@ -9,6 +9,7 @@
 #include "get_attr_string.h"
 #include "npy_import.h"
 #include "npy_static_data.h"
+#include "module_state.h"
 #include "multiarraymodule.h"
 
 #include "arrayfunction_override.h"
@@ -20,15 +21,16 @@
 static PyObject *
 get_array_function(PyObject *obj)
 {
+    multiarray_umath_state *state = _npy_module_state;
     /* Fast return for ndarray */
     if (PyArray_CheckExact(obj)) {
-        Py_INCREF(npy_static_pydata.ndarray_array_function);
-        return npy_static_pydata.ndarray_array_function;
+        Py_INCREF(state->static_pydata.ndarray_array_function);
+        return state->static_pydata.ndarray_array_function;
     }
 
     PyObject *array_function;
     if (PyArray_LookupSpecial(
-            obj, npy_interned_str.array_function, &array_function) < 0) {
+            obj, state->interned_str.array_function, &array_function) < 0) {
         PyErr_Clear(); /* TODO[gh-14801]: propagate crashes during attribute access? */
     }
 
@@ -128,7 +130,7 @@ fail:
 static int
 is_default_array_function(PyObject *obj)
 {
-    return obj == npy_static_pydata.ndarray_array_function;
+    return obj == _npy_module_state->static_pydata.ndarray_array_function;
 }
 
 
@@ -165,7 +167,7 @@ array_function_method_impl(PyObject *func, PyObject *types, PyObject *args,
      */
     PyObject *implementation;
     if (PyObject_GetOptionalAttr(
-            func, npy_interned_str.implementation, &implementation) < 0) {
+            func, _npy_module_state->interned_str.implementation, &implementation) < 0) {
         return NULL;
     }
     else if (implementation == NULL) {
@@ -244,13 +246,14 @@ get_args_and_kwargs(
 static void
 set_no_matching_types_error(PyObject *public_api, PyObject *types)
 {
+    multiarray_umath_state *state = _npy_module_state;
     /* No acceptable override found, raise TypeError. */
     if (npy_cache_import_runtime(
             "numpy._core._internal",
             "array_function_errmsg_formatter",
-            &npy_runtime_imports.array_function_errmsg_formatter) == 0) {
+            &state->runtime_imports.array_function_errmsg_formatter) == 0) {
         PyObject *errmsg = PyObject_CallFunctionObjArgs(
-                npy_runtime_imports.array_function_errmsg_formatter,
+                state->runtime_imports.array_function_errmsg_formatter,
                 public_api, types, NULL);
         if (errmsg != NULL) {
             PyErr_SetObject(PyExc_TypeError, errmsg);
@@ -272,6 +275,7 @@ array_implement_c_array_function_creation(
     PyObject *args, PyObject *kwargs,
     PyObject *const *fast_args, Py_ssize_t len_args, PyObject *kwnames)
 {
+    multiarray_umath_state *state = _npy_module_state;
     PyObject *dispatch_types = NULL;
     PyObject *numpy_module = NULL;
     PyObject *public_api = NULL;
@@ -313,12 +317,12 @@ array_implement_c_array_function_creation(
     }
 
     /* The like argument must be present in the keyword arguments, remove it */
-    if (PyDict_DelItem(kwargs, npy_interned_str.like) < 0) {
+    if (PyDict_DelItem(kwargs, state->interned_str.like) < 0) {
         goto finish;
     }
 
     /* Fetch the actual symbol (the long way right now) */
-    numpy_module = PyImport_Import(npy_interned_str.numpy);
+    numpy_module = PyImport_Import(state->interned_str.numpy);
     if (numpy_module == NULL) {
         goto finish;
     }
