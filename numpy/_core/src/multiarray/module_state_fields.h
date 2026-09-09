@@ -178,6 +178,10 @@ extern "C" {
     F(current_handler) \
     F(global_pytype_to_type_dict)
 
+/* One ownership list declares the structs and drives traverse/clear. */
+#define NPY_DECLARE_ONE_PYOBJECT_FIELD(name) PyObject *name;
+#define NPY_DECLARE_PYOBJECT_FIELDS(list) list(NPY_DECLARE_ONE_PYOBJECT_FIELD)
+
 #define NPY_FIELD_COUNT_ONE(name) + 1
 #define NPY_FIELD_COUNT(list) (0 list(NPY_FIELD_COUNT_ONE))
 
