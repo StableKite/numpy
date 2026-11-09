@@ -13,6 +13,8 @@
 #include "npy_pycompat.h"
 
 #include "npy_buffer.h"
+#include "module_state.h"
+#include "dtype_traversal.h"
 #include "common.h"
 #include "numpyos.h"
 #include "arrayobject.h"
@@ -614,12 +616,48 @@ buffer_info_tag(void *buffer_info)
 }
 
 
+/* Tag 7 adds a pure-C ownership plan without changing ndarray's layout.
+ * Ordinary buffer caches retain their existing tag 3. */
+typedef struct {
+    _buffer_info_t *buffers;
+    npy_object_reference_plan *plan;
+    PyObject *native_owner;
+} npy_buffer_reference_cache;
+
+static inline npy_buffer_reference_cache *
+buffer_reference_cache(void *tagged)
+{
+    if (((uintptr_t)tagged & 0x7) == 7) {
+        return (npy_buffer_reference_cache *)((uintptr_t)tagged - 7);
+    }
+    return NULL;
+}
+
+NPY_NO_EXPORT PyObject *
+_buffer_info_get_native_owner(void *buffer_info)
+{
+    npy_buffer_reference_cache *cache = buffer_reference_cache(buffer_info);
+    return cache == NULL ? NULL : cache->native_owner;
+}
+
+NPY_NO_EXPORT const npy_object_reference_plan *
+_buffer_info_get_object_plan(void *buffer_info)
+{
+    npy_buffer_reference_cache *cache = buffer_reference_cache(buffer_info);
+    return cache == NULL ? NULL : cache->plan;
+}
+
 static inline int
 _buffer_info_untag(
         void *tagged_buffer_info, _buffer_info_t **buffer_info, PyObject *obj)
 {
     if (tagged_buffer_info == NULL) {
         *buffer_info = NULL;
+        return 0;
+    }
+    npy_buffer_reference_cache *cache = buffer_reference_cache(tagged_buffer_info);
+    if (cache != NULL) {
+        *buffer_info = cache->buffers;
         return 0;
     }
     if (NPY_UNLIKELY(((uintptr_t)tagged_buffer_info & 0x7) != 3)) {
@@ -679,6 +717,13 @@ _buffer_info_free(void *buffer_info, PyObject *obj)
         return -1;
     }
     _buffer_info_free_untagged(untagged_buffer_info);
+    npy_buffer_reference_cache *cache = buffer_reference_cache(buffer_info);
+    if (cache != NULL) {
+        npy_object_reference_plan_free(cache->plan);
+        PyObject *owner = cache->native_owner;
+        PyMem_RawFree(cache);
+        Py_XDECREF(owner);
+    }
     return 0;
 }
 
@@ -687,6 +732,84 @@ _buffer_info_free(void *buffer_info, PyObject *obj)
  * Get the buffer info returning either the old one (passed in) or a new
  * buffer info which adds holds on to (and thus replaces) the old one.
  */
+static int
+buffer_info_init_reference_plan(void **tagged, PyObject *owner, PyArray_Descr *descr)
+{
+    npy_object_reference_plan *plan;
+    if (npy_object_reference_plan_new(descr, &plan) < 0) {
+        return -1;
+    }
+    if (plan == NULL) {
+        return 0;
+    }
+    npy_buffer_reference_cache *existing = buffer_reference_cache(*tagged);
+    if (existing != NULL) {
+        if (existing->plan != NULL) {
+            npy_object_reference_plan_free(plan);
+            PyErr_SetString(PyExc_SystemError, "array reference plan already initialized");
+            return -1;
+        }
+        existing->plan = plan;
+        return 0;
+    }
+    _buffer_info_t *buffers;
+    if (_buffer_info_untag(*tagged, &buffers, owner) < 0) {
+        npy_object_reference_plan_free(plan);
+        return -1;
+    }
+    npy_buffer_reference_cache *cache = PyMem_RawMalloc(sizeof(*cache));
+    if (cache == NULL) {
+        npy_object_reference_plan_free(plan);
+        PyErr_NoMemory();
+        return -1;
+    }
+    cache->buffers = buffers;
+    cache->plan = plan;
+    cache->native_owner = NULL;
+    *tagged = (void *)((uintptr_t)cache + 7);
+    return 0;
+}
+
+NPY_NO_EXPORT int
+_buffer_info_init_native_owner(PyObject *object, void **tagged)
+{
+    PyObject *owner = _npy_module_state->lifetime_owner;
+    if (owner == NULL) {
+        return 0;  /* Main ABI and cache behavior are unchanged. */
+    }
+    npy_buffer_reference_cache *cache = buffer_reference_cache(*tagged);
+    if (cache == NULL) {
+        _buffer_info_t *buffers;
+        if (_buffer_info_untag(*tagged, &buffers, object) < 0) {
+            return -1;
+        }
+        cache = PyMem_RawCalloc(1, sizeof(*cache));
+        if (cache == NULL) {
+            PyErr_NoMemory();
+            return -1;
+        }
+        cache->buffers = buffers;
+        *tagged = (void *)((uintptr_t)cache + 7);
+    }
+    if (cache->native_owner == NULL) {
+        cache->native_owner = Py_NewRef(owner);
+    }
+    return 0;
+}
+
+NPY_NO_EXPORT int
+_buffer_info_init_object_plan(PyArrayObject *array, PyArray_Descr *descr)
+{
+    return buffer_info_init_reference_plan(
+            &((PyArrayObject_fields *)array)->_buffer_info, (PyObject *)array, descr);
+}
+
+NPY_NO_EXPORT int
+_buffer_info_init_void_object_plan(PyObject *scalar, PyArray_Descr *descr)
+{
+    return buffer_info_init_reference_plan(&((PyVoidScalarObject *)scalar)->_buffer_info, scalar, descr);
+}
+
 static _buffer_info_t*
 _buffer_get_info(void **buffer_info_cache_ptr, PyObject *obj, int flags)
 {
@@ -741,7 +864,13 @@ _buffer_get_info(void **buffer_info_cache_ptr, PyObject *obj, int flags)
     else {
         /* Insert new info as first item in the linked buffer-info list. */
         info->next = stored_info;
-        *buffer_info_cache_ptr = buffer_info_tag(info);
+        npy_buffer_reference_cache *cache = buffer_reference_cache(*buffer_info_cache_ptr);
+        if (cache != NULL) {
+            cache->buffers = info;
+        }
+        else {
+            *buffer_info_cache_ptr = buffer_info_tag(info);
+        }
     }
 
     return info;

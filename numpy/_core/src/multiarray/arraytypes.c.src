@@ -26,6 +26,7 @@
 #include "module_state.h"
 #include "convert_datatype.h"
 #include "dtypemeta.h"
+#include "descriptor.h"
 #include "lowlevel_strided_loops.h"
 #include "usertypes.h"
 #include "_datetime.h"
@@ -4110,18 +4111,24 @@ static PyArray_ArrFuncs _Py@NAME@_ArrFuncs = {
 };
 
 
-static _PyArray_LegacyDescr @from@_Descr = {
-    PyObject_HEAD_INIT(&PyArrayDescr_Type)
-    .typeobj = &Py@NAME@ArrType_Type,
-    .kind = NPY_@from@LTR,
-    .type = NPY_@from@LTR,
-    .byteorder = '@endian@',
-    .flags = @flags@,
-    .type_num = NPY_@from@,
-    .elsize = 0,
-    .alignment = NPY_ALIGNOF(@align@),
-    .hash = -1,
-};
+static int
+init_@from@_descr(multiarray_umath_state *state)
+{
+    _PyArray_LegacyDescr *descr = npy_alloc_legacy_descr(&PyArrayDescr_Type, NPY_TRUE);
+    if (descr == NULL) {
+        return -1;
+    }
+    descr->typeobj = (PyTypeObject *)Py_NewRef(&Py@NAME@ArrType_Type);
+    descr->kind = NPY_@from@LTR;
+    descr->type = NPY_@from@LTR;
+    descr->byteorder = '@endian@';
+    descr->flags = @flags@;
+    descr->type_num = NPY_@from@;
+    descr->alignment = NPY_ALIGNOF(@align@);
+    descr->hash = -1;
+    state->builtin_descrs[NPY_@from@] = descr;
+    return 0;
+}
 
 /**end repeat**/
 
@@ -4216,18 +4223,25 @@ static PyArray_ArrFuncs _Py@NAME@_ArrFuncs = {
 /*
  * FIXME: check for PY3K
  */
-NPY_NO_EXPORT _PyArray_LegacyDescr @from@_Descr = {
-    PyObject_HEAD_INIT(&PyArrayDescr_Type)
-    .typeobj = &Py@NAME@ArrType_Type,
-    .kind = NPY_@kind@LTR,
-    .type = NPY_@from@LTR,
-    .byteorder = '@endian@',
-    .flags = @isobject@,
-    .type_num = NPY_@from@,
-    .elsize = sizeof(@fromtype@),
-    .alignment = NPY_ALIGNOF(@fromtype@),
-    .hash = -1,
-};
+static int
+init_@from@_descr(multiarray_umath_state *state)
+{
+    _PyArray_LegacyDescr *descr = npy_alloc_legacy_descr(&PyArrayDescr_Type, NPY_TRUE);
+    if (descr == NULL) {
+        return -1;
+    }
+    descr->typeobj = (PyTypeObject *)Py_NewRef(&Py@NAME@ArrType_Type);
+    descr->kind = NPY_@kind@LTR;
+    descr->type = NPY_@from@LTR;
+    descr->byteorder = '@endian@';
+    descr->flags = @isobject@;
+    descr->type_num = NPY_@from@;
+    descr->elsize = sizeof(@fromtype@);
+    descr->alignment = NPY_ALIGNOF(@fromtype@);
+    descr->hash = -1;
+    state->builtin_descrs[NPY_@from@] = descr;
+    return 0;
+}
 
 /**end repeat**/
 
@@ -4235,32 +4249,25 @@ NPY_NO_EXPORT _PyArray_LegacyDescr @from@_Descr = {
 #define _MAX_LETTER ('z' + 1)
 #define LETTER_TO_NUM(letter) _npy_module_state->static_cdata._letter_to_num[letter - '?']
 
-static _PyArray_LegacyDescr *_builtin_descrs[] = {
-    &BOOL_Descr,
-    &BYTE_Descr,
-    &UBYTE_Descr,
-    &SHORT_Descr,
-    &USHORT_Descr,
-    &INT_Descr,
-    &UINT_Descr,
-    &LONG_Descr,
-    &ULONG_Descr,
-    &LONGLONG_Descr,
-    &ULONGLONG_Descr,
-    &FLOAT_Descr,
-    &DOUBLE_Descr,
-    &LONGDOUBLE_Descr,
-    &CFLOAT_Descr,
-    &CDOUBLE_Descr,
-    &CLONGDOUBLE_Descr,
-    &OBJECT_Descr,
-    &STRING_Descr,
-    &UNICODE_Descr,
-    &VOID_Descr,
-    &DATETIME_Descr,
-    &TIMEDELTA_Descr,
-    &HALF_Descr
-};
+#define _builtin_descrs (_npy_module_state->builtin_descrs)
+
+NPY_NO_EXPORT int
+init_builtin_legacy_descrs(void)
+{
+    multiarray_umath_state *state = _npy_module_state;
+    /**begin repeat
+     * #name = BOOL, BYTE, UBYTE, SHORT, USHORT, INT, UINT,
+     *         LONG, ULONG, LONGLONG, ULONGLONG,
+     *         HALF, FLOAT, DOUBLE, LONGDOUBLE,
+     *         CFLOAT, CDOUBLE, CLONGDOUBLE,
+     *         OBJECT, STRING, UNICODE, VOID, DATETIME, TIMEDELTA#
+     */
+    if (init_@name@_descr(state) < 0) {
+        return -1;
+    }
+    /**end repeat**/
+    return 0;
+}
 
 /*NUMPY_API
  * Get the PyArray_Descr structure for a type.
@@ -4615,8 +4622,6 @@ set_typeinfo(PyObject *dict)
 
     /**end repeat**/
 
-    initialize_legacy_dtypemeta_aliases(_builtin_descrs);
-
     /*
      * Add sorting array methods for the new types.
      */
@@ -4731,7 +4736,7 @@ set_typeinfo(PyObject *dict)
       *         DATETIME, TIMEDELTA#
       */
 
-    @name@_Descr.fields = Py_None;
+    _builtin_descrs[NPY_@name@]->fields = Py_NewRef(Py_None);
 
     /**end repeat**/
 
@@ -4740,7 +4745,7 @@ set_typeinfo(PyObject *dict)
       * #name = STRING, UNICODE, VOID#
       */
 
-    PyDataType_MAKEUNSIZED((PyArray_Descr *)&@name@_Descr);
+    PyDataType_MAKEUNSIZED((PyArray_Descr *)_builtin_descrs[NPY_@name@]);
 
     /**end repeat**/
 
@@ -4817,7 +4822,6 @@ set_typeinfo(PyObject *dict)
      * (duplicates making the name lowercase)
      */
 #define SETTYPE(Name, name)                                    \
-    Py_INCREF(&Py##Name##ArrType_Type);                  \
     if (PyDict_SetItemString(dict, #name,                \
             (PyObject *)&Py##Name##ArrType_Type) < 0) {  \
         goto error;                                      \

@@ -1,6 +1,8 @@
 import contextlib
 import ctypes
 import inspect
+import json
+import subprocess
 import operator
 import os
 import pickle
@@ -17,7 +19,9 @@ from hypothesis.extra import numpy as hynp
 
 import numpy as np
 import numpy.dtypes
-from numpy._core._multiarray_tests import create_custom_field_dtype
+from numpy._core._multiarray_tests import (
+    create_custom_field_dtype, descr_clone_failure, dtype_meta_clear_cycle,
+)
 from numpy._core._rational_tests import rational, rational2
 from numpy.testing import (
     HAS_REFCOUNT,
@@ -29,6 +33,11 @@ from numpy.testing import (
     assert_raises,
 )
 from numpy.testing._private.utils import requires_deep_recursion
+
+
+def test_dtype_meta_clears_owned_references():
+    for _ in range(24):
+        assert_(dtype_meta_clear_cycle())
 
 
 def assert_dtype_equal(a, b):
@@ -2151,3 +2160,144 @@ class TestDTypeSignatures:
 
         params_actual = set(sig.parameters)
         assert params_actual == params_expect
+
+
+@pytest.mark.parametrize("dtype_name", [
+    "Float64DType", "StringDType", "BoolDType", "Int32DType",
+])
+@pytest.mark.parametrize("phase", ["before", "after"])
+def test_dtype_publication_retry(dtype_name, phase, tmp_path):
+    # Import NumPy only after installing the one-shot Python publication fault.
+    script = r"""import json
+from pathlib import Path
+import sys
+import traceback
+
+dtype_name, phase, target = sys.argv[1:]
+assert phase in {"before", "after"}
+assert dtype_name in {
+    "Float64DType",
+    "StringDType",
+    "BoolDType",
+    "Int32DType",
+}
+target = Path(target)
+assert not target.exists()
+initial_gil = getattr(sys, "_is_gil_enabled", lambda: True)()
+hit = False
+marker = "one-shot dtype publication fault: " + dtype_name + ":" + phase
+
+
+def inject(frame, event, arg):
+    if event != "return" or frame.f_code.co_name != "<module>":
+        return
+    namespace = frame.f_globals
+    if namespace.get("__name__") != "numpy.dtypes":
+        return
+    sys.setprofile(None)
+    original = namespace["_add_dtype_helper"]
+
+    def publish(dtype, alias):
+        global hit
+        if dtype.__name__ == dtype_name and not hit:
+            hit = True
+            namespace["_add_dtype_helper"] = original
+            if phase == "after":
+                original(dtype, alias)
+            raise ImportError(marker)
+        return original(dtype, alias)
+
+    namespace["_add_dtype_helper"] = publish
+
+
+def attempt():
+    try:
+        import numpy as np
+    except Exception as error:
+        return {
+            "status": "IMPORT_ERROR"
+            if isinstance(error, ImportError)
+            else "ERROR",
+            "traceback": traceback.format_exc(),
+            "core_in_sys_modules": "numpy._core._multiarray_umath"
+            in sys.modules,
+            "GIL": getattr(sys, "_is_gil_enabled", lambda: True)(),
+        }
+    assert np.arange(8).sum() == 28
+    assert np.bool_(True) is np.bool_(True)
+    assert np.dtypes.BoolDType is type(np.dtype("?"))
+    assert np.dtypes.Int32DType is type(np.dtype("i4"))
+    assert np.dtypes.StringDType is type(np.dtype("T"))
+    assert len(np.dtypes.__all__) == len(set(np.dtypes.__all__))
+    return {
+        "status": "IMPORTED",
+        "version": np.__version__,
+        "operations": "PASS",
+        "core_in_sys_modules": "numpy._core._multiarray_umath" in sys.modules,
+        "GIL": getattr(sys, "_is_gil_enabled", lambda: True)(),
+    }
+
+
+sys.setprofile(inject)
+try:
+    first = attempt()
+finally:
+    sys.setprofile(None)
+assert (
+    hit and first["status"] == "IMPORT_ERROR" and marker in first["traceback"]
+)
+retry = attempt()
+assert first["GIL"] is retry["GIL"] is initial_gil
+record = {
+    "dtype": dtype_name,
+    "phase": phase,
+    "runtime": sys.version,
+    "first": first,
+    "retry": retry,
+}
+target.write_text(json.dumps(record, indent=2) + "\n")
+print(
+    json.dumps(
+        {
+            "dtype": dtype_name,
+            "phase": phase,
+            "first": first["status"],
+            "retry": retry["status"],
+        }
+    ),
+    flush=True,
+)
+"""
+    target = tmp_path / "retry.json"
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", script, dtype_name, phase, str(target)],
+        capture_output=True, timeout=60, check=False,
+    )
+    assert_equal(result.returncode, 0, result.stderr.decode(errors="replace"))
+    observed = json.loads(target.read_text())
+    assert_equal(observed["first"]["status"], "IMPORT_ERROR")
+    assert_(observed["first"]["core_in_sys_modules"])
+    assert_equal(observed["retry"]["status"], "IMPORTED")
+    assert_equal(observed["retry"]["operations"], "PASS")
+
+
+@pytest.mark.parametrize("original_error", [False, True])
+def test_descr_clone_failure_ownership(original_error):
+    for _ in range(24):
+        lost_metadata, lost_scalar, failed, memory, original, clones, frees = (
+            descr_clone_failure(original_error))
+        assert_equal((lost_metadata, lost_scalar), (0, 0))
+        assert_equal((failed, clones, frees), (1, 1, 1))
+        assert_equal(bool(memory), not original_error)
+        assert_equal(bool(original), original_error)
+
+
+@pytest.mark.parametrize("scalar", [np.int32, np.float64, np.complex128])
+def test_dtype_gc_visits_within_dtype_cast(scalar):
+    import gc
+
+    dtype_class = type(np.dtype(scalar))
+    bound = np._core._multiarray_umath._get_castingimpl(dtype_class, dtype_class)
+    method, = [value for value in gc.get_referents(bound)
+               if type(value).__name__ == "_ArrayMethod"]
+    assert sum(value is method for value in gc.get_referents(dtype_class)) == 1

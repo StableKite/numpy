@@ -78,7 +78,29 @@ npy_int32 extract_unit_32(npy_int32 *d, npy_int32 unit) {
 NPY_NO_EXPORT void
 numpy_pydatetime_import(void)
 {
+#if PY_VERSION_HEX >= 0x030f0000
+    /* CPython 3.15 exposes one immutable process CAPI backed by static native
+     * types. Import in every interpreter, then publish the native pointer once.
+     * Never hold the mutex across imports, allocation, or Python callbacks. */
+    PyDateTime_CAPI *candidate =
+            (PyDateTime_CAPI *)PyCapsule_Import(PyDateTime_CAPSULE_NAME, 0);
+    if (candidate == NULL) {
+        return;
+    }
+    static PyMutex datetime_api_mutex = {0};
+    PyMutex_Lock(&datetime_api_mutex);
+    if (PyDateTimeAPI == NULL) {
+        PyDateTimeAPI = candidate;
+    }
+    int same_api = PyDateTimeAPI == candidate;
+    PyMutex_Unlock(&datetime_api_mutex);
+    if (!same_api) {
+        PyErr_SetString(PyExc_ImportError,
+                "CPython datetime C API changed between interpreters");
+    }
+#else
     PyDateTime_IMPORT;
+#endif
 }
 
 /* Exported as DATETIMEUNITS in multiarraymodule.c */

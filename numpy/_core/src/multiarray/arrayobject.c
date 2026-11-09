@@ -58,6 +58,7 @@ maintainer email:  oliphant.travis@ieee.org
 #include "mem_overlap.h"
 #include "numpyos.h"
 #include "refcount.h"
+#include "dtype_traversal.h"
 #include "strfuncs.h"
 
 #include "binop_override.h"
@@ -387,13 +388,6 @@ _clear_array_attributes(PyArrayObject *self, npy_bool unraisable)
 {
     PyArrayObject_fields *fa = (PyArrayObject_fields *)self;
 
-    if (_buffer_info_free(fa->_buffer_info, (PyObject *)self) < 0) {
-        if (write_and_clear_error_if_unraisable(-1, unraisable) < 0) {
-            return -1;
-        }
-    }
-    fa->_buffer_info = NULL;
-
     if (fa->base) {
         if (PyArray_FLAGS(self) & NPY_ARRAY_WRITEBACKIFCOPY)
         {
@@ -453,6 +447,13 @@ _clear_array_attributes(PyArrayObject *self, npy_bool unraisable)
         }
         fa->data = NULL;
     }
+    if (_buffer_info_free(fa->_buffer_info, (PyObject *)self) < 0) {
+        if (write_and_clear_error_if_unraisable(-1, unraisable) < 0) {
+            return -1;
+        }
+    }
+    fa->_buffer_info = NULL;
+
     Py_CLEAR(fa->mem_handler);
 
     /* must match allocation in PyArray_NewFromDescr */
@@ -465,6 +466,20 @@ _clear_array_attributes(PyArrayObject *self, npy_bool unraisable)
 static void
 array_dealloc(PyArrayObject *self)
 {
+    if (PyObject_GC_IsTracked((PyObject *)self)) {
+        PyObject_GC_UnTrack(self);
+    }
+    PyTypeObject *type = Py_TYPE(self);
+    PyTypeObject *base = type;
+    while (base->tp_dealloc != (destructor)array_dealloc) {
+        base = base->tp_base;
+        assert(base != NULL);
+    }
+    int base_is_heap = base->tp_flags & Py_TPFLAGS_HEAPTYPE;
+    /* The buffer cache releases its owner during attribute cleanup. Keep
+     * native state alive through the final type/free operations as well. */
+    PyObject *native_owner = Py_XNewRef(_buffer_info_get_native_owner(
+            ((PyArrayObject_fields *)self)->_buffer_info));
     // NPY_TRUE flags that errors are unraisable.
     int ret = _clear_array_attributes(self, NPY_TRUE);
     // silence unused variable warning in release builds
@@ -474,7 +489,11 @@ array_dealloc(PyArrayObject *self)
     if (((PyArrayObject_fields *)self)->weakreflist != NULL) {
         PyObject_ClearWeakRefs((PyObject *)self);
     }
-    Py_TYPE(self)->tp_free((PyObject *)self);
+    type->tp_free((PyObject *)self);
+    if (base_is_heap) {
+        Py_DECREF(type);
+    }
+    Py_XDECREF(native_owner);
 }
 
 NPY_NO_EXPORT int
@@ -1264,12 +1283,191 @@ array_iter(PyArrayObject *arr)
 }
 
 
-NPY_NO_EXPORT PyTypeObject PyArray_Type = {
+typedef struct {
+    char *data;
+    PyArray_Descr *descr;
+    npy_intp index;
+    npy_intp count;
+    int mode;
+} npy_array_gc_frame;
+
+
+/* Walk dtype layout iteratively: nested subarrays/fields need no C recursion. */
+static int
+array_gc_visit_item(char *data, PyArray_Descr *descr, visitproc visit, void *arg)
+{
+    npy_array_gc_frame local[16];
+    npy_array_gc_frame *frames = local;
+    npy_intp capacity = Py_ARRAY_LENGTH(local);
+    npy_intp depth = 1;
+    int result = 0;
+    frames[0] = (npy_array_gc_frame){.data = data, .descr = descr};
+    while (depth != 0) {
+        npy_array_gc_frame *frame = &frames[depth - 1];
+        if (frame->mode == 0) {
+            if (frame->descr->type_num == NPY_OBJECT) {
+                PyObject *item;
+                memcpy(&item, frame->data, sizeof(item));
+                if (item != NULL && (result = visit(item, arg)) != 0) {
+                    goto done;
+                }
+                depth--;
+                continue;
+            }
+            if (!PyDataType_ISLEGACY(frame->descr)
+                    || !PyDataType_REFCHK(frame->descr)) {
+                depth--;
+                continue;
+            }
+            _PyArray_LegacyDescr *legacy = (_PyArray_LegacyDescr *)frame->descr;
+            if (legacy->subarray != NULL) {
+                npy_intp step = legacy->subarray->base->elsize;
+                frame->count = step == 0 ? 0 : legacy->elsize / step;
+                frame->mode = 1;
+            }
+            else if (legacy->names != NULL) {
+                frame->count = PyTuple_GET_SIZE(legacy->names);
+                frame->mode = 2;
+            }
+            else {
+                depth--;
+                continue;
+            }
+        }
+        if (frame->index == frame->count) {
+            depth--;
+            continue;
+        }
+        npy_array_gc_frame child = {0};
+        _PyArray_LegacyDescr *legacy = (_PyArray_LegacyDescr *)frame->descr;
+        if (frame->mode == 1) {
+            child.descr = legacy->subarray->base;
+            child.data = frame->data + frame->index * child.descr->elsize;
+        }
+        else {
+            PyObject *name = PyTuple_GET_ITEM(legacy->names, frame->index);
+            PyObject *field = PyDict_GetItemWithError(legacy->fields, name);
+            if (field == NULL) {
+                if (!PyErr_Occurred()) {
+                    PyErr_SetString(PyExc_SystemError, "missing structured dtype field");
+                }
+                result = -1;
+                goto done;
+            }
+            child.descr = (PyArray_Descr *)PyTuple_GET_ITEM(field, 0);
+            Py_ssize_t offset = PyLong_AsSsize_t(PyTuple_GET_ITEM(field, 1));
+            if (offset == -1 && PyErr_Occurred()) {
+                result = -1;
+                goto done;
+            }
+            child.data = frame->data + offset;
+        }
+        frame->index++;
+        if (depth == capacity) {
+            if (capacity > PY_SSIZE_T_MAX / (2 * (Py_ssize_t)sizeof(*frames))) {
+                PyErr_NoMemory();
+                result = -1;
+                goto done;
+            }
+            npy_intp new_capacity = 2 * capacity;
+            npy_array_gc_frame *larger = PyMem_RawMalloc(new_capacity * sizeof(*frames));
+            if (larger == NULL) {
+                PyErr_NoMemory();
+                result = -1;
+                goto done;
+            }
+            memcpy(larger, frames, depth * sizeof(*frames));
+            if (frames != local) {
+                PyMem_RawFree(frames);
+            }
+            frames = larger;
+            capacity = new_capacity;
+        }
+        frames[depth++] = child;
+    }
+done:
+    if (frames != local) {
+        PyMem_RawFree(frames);
+    }
+    return result;
+}
+
+
+static int
+array_traverse(PyArrayObject *self, visitproc visit, void *arg)
+{
+    PyArrayObject_fields *fields = (PyArrayObject_fields *)self;
+    /* CPython's subtype_traverse visits the type for a static base, and
+     * delegates that visit to us when this implementation belongs to a heap base. */
+    PyTypeObject *base = Py_TYPE(self);
+    while (base->tp_traverse != (traverseproc)array_traverse) {
+        base = base->tp_base;
+        assert(base != NULL);
+    }
+    if (base->tp_flags & Py_TPFLAGS_HEAPTYPE) {
+        Py_VISIT(Py_TYPE(self));
+    }
+    Py_VISIT(fields->base);
+    Py_VISIT(fields->descr);
+    Py_VISIT(fields->mem_handler);
+    Py_VISIT(_buffer_info_get_native_owner(fields->_buffer_info));
+    /* A view owns its base, not an additional reference to every data item. */
+    if (fields->data == NULL || fields->descr == NULL
+            || !PyArray_CHKFLAGS(self, NPY_ARRAY_OWNDATA)
+            || !PyDataType_REFCHK(fields->descr)
+            || !PyDataType_ISLEGACY(fields->descr)
+            || (fields->nd != 0
+                && (fields->dimensions == NULL || fields->strides == NULL))) {
+        return 0;
+    }
+    const npy_object_reference_plan *plan =
+            _buffer_info_get_object_plan(fields->_buffer_info);
+    if (plan != NULL) {
+        return npy_object_reference_plan_apply(plan, self, visit, arg);
+    }
+    npy_intp coordinates[NPY_MAXDIMS] = {0};
+    char *data = fields->data;
+    npy_intp size = PyArray_SIZE(self);
+    for (npy_intp i = 0; i < size; i++) {
+        int result = array_gc_visit_item(data, fields->descr, visit, arg);
+        if (result != 0) {
+            return result;
+        }
+        for (int axis = fields->nd - 1; axis >= 0; axis--) {
+            coordinates[axis]++;
+            data += fields->strides[axis];
+            if (coordinates[axis] < fields->dimensions[axis]) {
+                break;
+            }
+            data -= coordinates[axis] * fields->strides[axis];
+            coordinates[axis] = 0;
+        }
+    }
+    return 0;
+}
+
+
+static int
+array_clear(PyArrayObject *self)
+{
+    PyArrayObject_fields *fields = (PyArrayObject_fields *)self;
+    if (fields->data != NULL && fields->descr != NULL
+            && PyArray_CHKFLAGS(self, NPY_ARRAY_OWNDATA)
+            && PyDataType_REFCHK(fields->descr)) {
+        return PyArray_ClearArray(self);
+    }
+    return 0;
+}
+
+
+static PyTypeObject main_array_type = {
     PyVarObject_HEAD_INIT(NULL, 0)
     .tp_name = "numpy.ndarray",
     .tp_basicsize = sizeof(PyArrayObject_fields),
     /* methods */
     .tp_dealloc = (destructor)array_dealloc,
+    .tp_traverse = (traverseproc)array_traverse,
+    .tp_clear = (inquiry)array_clear,
     .tp_repr = (reprfunc)array_repr,
     .tp_as_number = &array_as_number,
     .tp_as_sequence = &array_as_sequence,
@@ -1285,6 +1483,100 @@ NPY_NO_EXPORT PyTypeObject PyArray_Type = {
     .tp_getset = array_getsetlist,
     .tp_new = (newfunc)array_new,
 };
+
+static PyMemberDef array_heap_members[] = {
+    {"__weaklistoffset__", T_PYSSIZET,
+     offsetof(PyArrayObject_fields, weakreflist), READONLY},
+    {NULL},
+};
+
+NPY_NO_EXPORT PyTypeObject *
+_npy_get_array_type(void)
+{
+    return _npy_module_state->array_type;
+}
+
+NPY_NO_EXPORT int
+init_array_type(PyObject *module)
+{
+    multiarray_umath_state *state = get_module_state(module);
+    if (PyInterpreterState_Get() == PyInterpreterState_Main()) {
+        /* Preserve existing static binary ndarray subclasses in the main. */
+        state->array_type = (PyTypeObject *)Py_NewRef(&main_array_type);
+        return 0;
+    }
+
+    /* Protocol tables contain only native function pointers, no PyObjects. */
+    PyType_Slot slots[] = {
+        {Py_tp_dealloc, array_dealloc},
+        {Py_tp_traverse, array_traverse},
+        {Py_tp_clear, array_clear},
+        {Py_tp_repr, array_repr},
+        {Py_tp_str, array_str},
+        {Py_tp_richcompare, array_richcompare},
+        {Py_tp_iter, array_iter},
+        {Py_tp_methods, array_methods},
+        {Py_tp_getset, array_getsetlist},
+        {Py_tp_members, array_heap_members},
+        {Py_tp_new, array_new},
+        {Py_nb_add, array_as_number.nb_add},
+        {Py_nb_subtract, array_as_number.nb_subtract},
+        {Py_nb_multiply, array_as_number.nb_multiply},
+        {Py_nb_remainder, array_as_number.nb_remainder},
+        {Py_nb_divmod, array_as_number.nb_divmod},
+        {Py_nb_power, array_as_number.nb_power},
+        {Py_nb_negative, array_as_number.nb_negative},
+        {Py_nb_positive, array_as_number.nb_positive},
+        {Py_nb_absolute, array_as_number.nb_absolute},
+        {Py_nb_bool, array_as_number.nb_bool},
+        {Py_nb_invert, array_as_number.nb_invert},
+        {Py_nb_lshift, array_as_number.nb_lshift},
+        {Py_nb_rshift, array_as_number.nb_rshift},
+        {Py_nb_and, array_as_number.nb_and},
+        {Py_nb_xor, array_as_number.nb_xor},
+        {Py_nb_or, array_as_number.nb_or},
+        {Py_nb_int, array_as_number.nb_int},
+        {Py_nb_float, array_as_number.nb_float},
+        {Py_nb_inplace_add, array_as_number.nb_inplace_add},
+        {Py_nb_inplace_subtract, array_as_number.nb_inplace_subtract},
+        {Py_nb_inplace_multiply, array_as_number.nb_inplace_multiply},
+        {Py_nb_inplace_remainder, array_as_number.nb_inplace_remainder},
+        {Py_nb_inplace_power, array_as_number.nb_inplace_power},
+        {Py_nb_inplace_lshift, array_as_number.nb_inplace_lshift},
+        {Py_nb_inplace_rshift, array_as_number.nb_inplace_rshift},
+        {Py_nb_inplace_and, array_as_number.nb_inplace_and},
+        {Py_nb_inplace_xor, array_as_number.nb_inplace_xor},
+        {Py_nb_inplace_or, array_as_number.nb_inplace_or},
+        {Py_nb_floor_divide, array_as_number.nb_floor_divide},
+        {Py_nb_true_divide, array_as_number.nb_true_divide},
+        {Py_nb_inplace_floor_divide, array_as_number.nb_inplace_floor_divide},
+        {Py_nb_inplace_true_divide, array_as_number.nb_inplace_true_divide},
+        {Py_nb_index, array_as_number.nb_index},
+        {Py_nb_matrix_multiply, array_as_number.nb_matrix_multiply},
+        {Py_nb_inplace_matrix_multiply, array_as_number.nb_inplace_matrix_multiply},
+        {Py_sq_length, array_as_sequence.sq_length},
+        {Py_sq_concat, array_as_sequence.sq_concat},
+        {Py_sq_item, array_as_sequence.sq_item},
+        {Py_sq_ass_item, array_as_sequence.sq_ass_item},
+        {Py_sq_contains, array_as_sequence.sq_contains},
+        {Py_mp_length, array_as_mapping.mp_length},
+        {Py_mp_subscript, array_as_mapping.mp_subscript},
+        {Py_mp_ass_subscript, array_as_mapping.mp_ass_subscript},
+        {Py_bf_getbuffer, array_as_buffer.bf_getbuffer},
+        {0, NULL},
+    };
+    PyType_Spec spec = {
+        .name = "numpy.ndarray",
+        .basicsize = sizeof(PyArrayObject_fields),
+        .flags = (Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE
+                  | Py_TPFLAGS_SEQUENCE | Py_TPFLAGS_IMMUTABLETYPE
+                  | Py_TPFLAGS_HAVE_GC),
+        .slots = slots,
+    };
+    state->array_type = (PyTypeObject *)PyType_FromModuleAndSpec(
+            module, &spec, NULL);
+    return state->array_type == NULL ? -1 : 0;
+}
 
 /*
  * Python stable ABI compatible object field accessor functions.

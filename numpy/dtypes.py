@@ -77,10 +77,13 @@ def _add_dtype_helper(DType, alias):
     # through `numpy._core._multiarray_umath` namespace or similar.
     from numpy import dtypes
 
-    setattr(dtypes, DType.__name__, DType)
-    __all__.append(DType.__name__)
+    name = DType.__name__
+    setattr(dtypes, name, DType)
+    if name not in __all__:
+        __all__.append(name)
 
     if alias:
         alias = alias.removeprefix("numpy.dtypes.")
         setattr(dtypes, alias, DType)
-        __all__.append(alias)
+        if alias not in __all__:
+            __all__.append(alias)

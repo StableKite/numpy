@@ -296,7 +296,8 @@ PyUFunc_AddWrappingLoop(PyObject *ufunc_obj,
     Py_SETREF(bmeth, NULL);
 
     /* Finalize the "wrapped" part of the new ArrayMethod */
-    meth->wrapped_dtypes = PyMem_Malloc(ufunc->nargs * sizeof(PyArray_DTypeMeta *));
+    meth->wrapped_dtypes = PyMem_Calloc(
+            ufunc->nargs, sizeof(PyArray_DTypeMeta *));
     if (meth->wrapped_dtypes == NULL) {
         goto finish;
     }

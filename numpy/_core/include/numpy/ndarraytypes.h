@@ -1485,7 +1485,8 @@ typedef struct PyArray_StringDTypeObject PyArray_StringDTypeObject;
      * further modifications.
      */
     /* TODO: Make this definition public in the API, as soon as its settled */
-    NPY_NO_EXPORT extern PyTypeObject PyArrayDTypeMeta_Type;
+    NPY_NO_EXPORT PyTypeObject *_npy_get_dtype_meta_type(void);
+    #define PyArrayDTypeMeta_Type (*_npy_get_dtype_meta_type())
 
     /*
      * While NumPy DTypes would not need to be heap types the plan is to

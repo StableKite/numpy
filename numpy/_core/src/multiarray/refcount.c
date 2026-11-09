@@ -18,6 +18,7 @@
 #include "iterators.h"
 #include "dtypemeta.h"
 #include "refcount.h"
+#include "npy_buffer.h"
 #include "npy_config.h"
 #include "templ_common.h" /* for npy_mul_sizes_with_overflow */
 
@@ -113,6 +114,12 @@ PyArray_ZeroContiguousBuffer(
  PyArray_ClearArray(PyArrayObject *arr)
  {
     assert(PyArray_FLAGS(arr) & NPY_ARRAY_OWNDATA);
+
+    const npy_object_reference_plan *plan = _buffer_info_get_object_plan(
+            ((PyArrayObject_fields *)arr)->_buffer_info);
+    if (plan != NULL) {
+        return npy_object_reference_plan_apply(plan, arr, NULL, NULL);
+    }
 
     PyArray_Descr *descr = PyArray_DESCR(arr);
     if (!PyDataType_REFCHK(descr)) {

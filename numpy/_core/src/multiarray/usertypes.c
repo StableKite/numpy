@@ -38,14 +38,20 @@ maintainer email:  oliphant.travis@ieee.org
 
 #include "usertypes.h"
 #include "dtypemeta.h"
+#include "descriptor.h"
 #include "scalartypes.h"
 #include "array_method.h"
 #include "convert_datatype.h"
 #include "dtype_traversal.h"
 #include "legacy_dtype_implementation.h"
+#include "module_state.h"
 
 
-NPY_NO_EXPORT _PyArray_LegacyDescr **userdescrs = NULL;
+NPY_NO_EXPORT _PyArray_LegacyDescr ***
+_npy_get_userdescrs(void)
+{
+    return &_npy_module_state->user_descrs;
+}
 
 static int
 _append_new(int **p_types, int insert)
@@ -144,52 +150,59 @@ _PyArray_LegacyDescrNewFromPrototype(
         PyTypeObject *descr_type, PyArray_DescrProto *descr_proto,
         npy_bool copy_metadata)
 {
-    _PyArray_LegacyDescr *descr = PyObject_Malloc(sizeof(_PyArray_LegacyDescr));
+    _PyArray_LegacyDescr *descr = npy_alloc_legacy_descr(descr_type, NPY_TRUE);
     if (descr == NULL) {
-        PyErr_NoMemory();
         return NULL;
     }
-    PyObject_INIT(descr, descr_type);
-
-    /* Copy all fields by name from the user-provided legacy prototype. */
-    Py_XINCREF(descr_proto->typeobj);
-    descr->typeobj = descr_proto->typeobj;
+    descr->typeobj = (PyTypeObject *)Py_XNewRef(descr_proto->typeobj);
     descr->kind = descr_proto->kind;
     descr->type = descr_proto->type;
     descr->byteorder = descr_proto->byteorder;
-    descr->_former_flags = 0;
     descr->flags = descr_proto->flags;
     descr->elsize = descr_proto->elsize;
     descr->alignment = descr_proto->alignment;
-    descr->subarray = descr_proto->subarray;
-    Py_XINCREF(descr_proto->fields);
-    descr->fields = descr_proto->fields;
-    Py_XINCREF(descr_proto->names);
-    descr->names = descr_proto->names;
+    descr->fields = Py_XNewRef(descr_proto->fields);
+    descr->names = Py_XNewRef(descr_proto->names);
     descr->hash = -1;
-    descr->reserved_null[0] = NULL;
-    descr->reserved_null[1] = NULL;
-
+    if (descr_proto->subarray != NULL) {
+        descr->subarray = PyMem_RawMalloc(sizeof(*descr->subarray));
+        if (descr->subarray == NULL) {
+            PyErr_NoMemory();
+            goto fail;
+        }
+        descr->subarray->base = (PyArray_Descr *)Py_NewRef(descr_proto->subarray->base);
+        descr->subarray->shape = Py_NewRef(descr_proto->subarray->shape);
+    }
     if (copy_metadata) {
-        Py_XINCREF(descr_proto->metadata);
-        descr->metadata = descr_proto->metadata;
+        descr->metadata = Py_XNewRef(descr_proto->metadata);
         if (descr_proto->c_metadata != NULL) {
             descr->c_metadata = NPY_AUXDATA_CLONE(descr_proto->c_metadata);
             if (descr->c_metadata == NULL) {
-                Py_DECREF(descr);
-                return NULL;
+                if (!PyErr_Occurred()) {
+                    PyErr_NoMemory();
+                }
+                goto fail;
             }
         }
-        else {
-            descr->c_metadata = NULL;
-        }
     }
-    else {
-        descr->metadata = NULL;
-        descr->c_metadata = NULL;
-    }
-
     return descr;
+fail:
+    /* A main-interpreter prototype may still have the abstract root type,
+     * whose normal deallocator does not treat its payload as legacy. */
+    Py_CLEAR(descr->typeobj);
+    Py_CLEAR(descr->fields);
+    Py_CLEAR(descr->names);
+    Py_CLEAR(descr->metadata);
+    if (descr->subarray != NULL) {
+        Py_XDECREF(descr->subarray->base);
+        Py_XDECREF(descr->subarray->shape);
+        PyMem_RawFree(descr->subarray);
+        descr->subarray = NULL;
+    }
+    NPY_AUXDATA_FREE(descr->c_metadata);
+    descr->c_metadata = NULL;
+    Py_DECREF(descr);
+    return NULL;
 }
 
 
@@ -281,12 +294,28 @@ PyArray_RegisterDataType(PyArray_DescrProto *descr_proto)
         }
     }
 
-    userdescrs = PyMem_RawRealloc(userdescrs,
+    /* Validate the replaceable prototype type before choosing its allocator.
+     * An unrelated Python heap class is not a descriptor allocation layout. */
+    int replaceable_type = Py_TYPE(descr_proto) == &PyArrayDescr_Type;
+    for (int index = 0; !replaceable_type && index < NPY_NTYPES_LEGACY; index++) {
+        PyArray_Descr *builtin = PyArray_DescrFromType(index);
+        replaceable_type = Py_TYPE(descr_proto) == Py_TYPE(builtin);
+        Py_DECREF(builtin);
+    }
+    if (!replaceable_type) {
+        PyErr_SetString(PyExc_RuntimeError,
+                "During creation/wrapping of legacy DType, the original class "
+                "was not of PyArrayDescr_Type or an existing builtin dtype");
+        return -1;
+    }
+
+    _PyArray_LegacyDescr **grown = PyMem_RawRealloc(userdescrs,
                          (NPY_NUMUSERTYPES+1)*sizeof(void *));
-    if (userdescrs == NULL) {
+    if (grown == NULL) {
         PyErr_SetString(PyExc_MemoryError, "RegisterDataType");
         return -1;
     }
+    userdescrs = grown;
 
     /* Build a name for the dynamically created new DType class. */
     const char *scalar_name = descr_proto->typeobj->tp_name;
@@ -333,7 +362,9 @@ PyArray_RegisterDataType(PyArray_DescrProto *descr_proto)
         descr->type_num = -1;
         NPY_NUMUSERTYPES--;
         /* Override the type, it might be wrong and then decref crashes */
-        Py_SET_TYPE(descr, &PyArrayDescr_Type);
+        PyTypeObject *failed_type = Py_TYPE(descr);
+        Py_SET_TYPE(descr, (PyTypeObject *)Py_NewRef(&PyArrayDescr_Type));
+        Py_DECREF(failed_type);
         Py_DECREF(descr);
         return -1;
     }

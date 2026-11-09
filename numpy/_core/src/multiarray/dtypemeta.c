@@ -35,21 +35,55 @@
 
 
 
+/* Every Python object owned by the native slots must be visible to GC. */
+#define NPY_DTYPE_METHOD_OBJECT_FIELDS(F) \
+    F(within_dtype_castingimpl)          \
+    F(castingimpls)                      \
+    F(sort_meth)                         \
+    F(argsort_meth)                      \
+    F(real_meth)                         \
+    F(imag_meth)                         \
+    F(f.castdict)
+
+
+static void
+dtypemeta_clear_owned_fields(PyArray_DTypeMeta *self)
+{
+    Py_CLEAR(self->scalar_type);
+    Py_CLEAR(self->singleton);
+    if (self->dt_slots != NULL) {
+#define NPY_CLEAR_METHOD(name) Py_CLEAR(NPY_DT_SLOTS(self)->name);
+        NPY_DTYPE_METHOD_OBJECT_FIELDS(NPY_CLEAR_METHOD)
+#undef NPY_CLEAR_METHOD
+    }
+}
+
+
+static int
+dtypemeta_clear(PyArray_DTypeMeta *self)
+{
+    dtypemeta_clear_owned_fields(self);
+    return PyType_Type.tp_clear((PyObject *)self);
+}
+
+
 static void
 dtypemeta_dealloc(PyArray_DTypeMeta *self) {
     /* Do not accidentally delete a statically defined DType: */
     assert(((PyTypeObject *)self)->tp_flags & Py_TPFLAGS_HEAPTYPE);
     NPY_DType_Slots *dt_slots = self->dt_slots;
+    PyTypeObject *metaclass = Py_TYPE(self);
+    int heap_metaclass = (metaclass->tp_flags & Py_TPFLAGS_HEAPTYPE) != 0;
 
     PyObject_GC_UnTrack(self);
 
-    Py_XDECREF(self->scalar_type);
-    Py_XDECREF(self->singleton);
-    if (dt_slots != NULL) {
-        Py_XDECREF(dt_slots->castingimpls);
-        PyMem_Free(dt_slots);
-    }
+    dtypemeta_clear_owned_fields(self);
+    PyMem_Free(dt_slots);
     PyType_Type.tp_dealloc((PyObject *) self);
+    /* type_dealloc handles its payload but assumes the builtin metaclass. */
+    if (heap_metaclass) {
+        Py_DECREF(metaclass);
+    }
 }
 
 static PyArray_DTypeMeta *
@@ -510,9 +544,23 @@ dtypemeta_is_gc(PyObject *dtype_class)
 static int
 dtypemeta_traverse(PyArray_DTypeMeta *type, visitproc visit, void *arg)
 {
-    Py_VISIT(type->singleton);
-    Py_VISIT(type->scalar_type);
-    Py_VISIT(NPY_DT_SLOTS(type)->castingimpls);
+    /* CPython's type_traverse does not visit the metaclass. NumPy's metaclass
+     * is a heap object and owns its interpreter module, so this edge cycles. */
+    if (Py_TYPE(type)->tp_flags & Py_TPFLAGS_HEAPTYPE) {
+        Py_VISIT(Py_TYPE(type));
+    }
+    /*
+     * ``dt_slots`` may still be NULL: a DType class created via
+     * ``PyType_FromMetaclass`` is tracked by the GC before we get a chance
+     * to fill it in.
+     */
+    if (type->dt_slots != NULL) {
+#define NPY_VISIT_METHOD(name) Py_VISIT(NPY_DT_SLOTS(type)->name);
+        NPY_DTYPE_METHOD_OBJECT_FIELDS(NPY_VISIT_METHOD)
+#undef NPY_VISIT_METHOD
+    }
+    Py_VISIT((PyObject *)type->singleton);
+    Py_VISIT((PyObject *)type->scalar_type);
     return PyType_Type.tp_traverse((PyObject *)type, visit, arg);
 }
 
@@ -860,7 +908,12 @@ void_ensure_canonical(_PyArray_LegacyDescr *self)
 static PyArray_Descr *
 void_common_instance(_PyArray_LegacyDescr *descr1, _PyArray_LegacyDescr *descr2)
 {
-    multiarray_umath_state *state = _npy_module_state;
+    PyTypeObject *metaclass = Py_TYPE(Py_TYPE(descr1));
+    PyObject *module = PyType_GetModule(metaclass);
+    if (module == NULL) {
+        return NULL;
+    }
+    multiarray_umath_state *state = get_module_state(module);
     if (descr1->subarray == NULL && descr1->names == NULL &&
             descr2->subarray == NULL && descr2->names == NULL) {
         if (descr1->elsize != descr2->elsize) {
@@ -1157,12 +1210,36 @@ object_common_dtype(
  *
  * @returns A borrowed references to the new DType or NULL.
  */
+/* No Python callbacks run until the core module has initialized completely. */
+NPY_NO_EXPORT int
+npy_add_dtype_publication(PyObject *module, PyObject *dtype, const char *alias)
+{
+    PyObject *records = PyDict_GetItemString(
+            PyModule_GetDict(module), "_dtype_publications");
+    if (records == NULL) {
+        PyErr_SetString(PyExc_SystemError, "missing DType publication list");
+        return -1;
+    }
+    PyObject *record = Py_BuildValue("(Oz)", dtype, alias);
+    if (record == NULL) {
+        return -1;
+    }
+    int result = PyList_Append(records, record);
+    Py_DECREF(record);
+    return result;
+}
+
+
 NPY_NO_EXPORT PyArray_DTypeMeta *
 dtypemeta_wrap_legacy_descriptor(
     _PyArray_LegacyDescr *descr, PyArray_ArrFuncs *arr_funcs,
     PyTypeObject *dtype_super_class, const char *name, const char *alias)
 {
-    multiarray_umath_state *state = _npy_module_state;
+    PyTypeObject *metaclass = Py_TYPE(dtype_super_class);
+    PyObject *module = PyType_GetModule(metaclass);
+    if (module == NULL) {
+        return NULL;
+    }
     int has_type_set = Py_TYPE(descr) == &PyArrayDescr_Type;
 
     if (!has_type_set) {
@@ -1214,7 +1291,7 @@ dtypemeta_wrap_legacy_descriptor(
         .slots = type_slots,
     };
     PyArray_DTypeMeta *dtype_class = (PyArray_DTypeMeta *)PyType_FromMetaclass(
-            &PyArrayDTypeMeta_Type, NULL, &spec, NULL);
+            metaclass, module, &spec, NULL);
     if (dtype_class == NULL) {
         PyMem_Free(dt_slots);
         return NULL;
@@ -1231,11 +1308,12 @@ dtypemeta_wrap_legacy_descriptor(
      * Fill DTypeMeta information that varies between DTypes, any variable
      * type information would need to be set before PyType_Ready().
      */
-    dtype_class->singleton = (PyArray_Descr *)descr;
+    dtype_class->singleton = (PyArray_Descr *)Py_NewRef(descr);
     Py_INCREF(descr->typeobj);
     dtype_class->scalar_type = descr->typeobj;
     dtype_class->type_num = descr->type_num;
     dt_slots->f = *arr_funcs;
+    Py_XINCREF(dt_slots->f.castdict);
 
     /* Set default functions (correct for most dtypes, override below) */
     dt_slots->default_descr = nonparametric_default_descr;
@@ -1313,29 +1391,28 @@ dtypemeta_wrap_legacy_descriptor(
     }
 
     /* Finally, replace the current class of the descr */
-    Py_SET_TYPE(descr, (PyTypeObject *)dtype_class);
+    PyTypeObject *old_type = Py_TYPE(descr);
+    Py_SET_TYPE(descr, (PyTypeObject *)Py_NewRef(dtype_class));
+    Py_DECREF(old_type);
 
-    /* And it to the types submodule if it is a builtin dtype */
+    /* Python namespace publication runs after native initialization. */
     if (!PyTypeNum_ISUSERDEF(descr->type_num)) {
-        if (npy_cache_import_runtime(
-                "numpy.dtypes", "_add_dtype_helper",
-                &state->runtime_imports._add_dtype_helper) == -1) {
-            goto fail;
-        }
-
-        if (PyObject_CallFunction(
-                state->runtime_imports._add_dtype_helper,
-                "Os", (PyObject *)dtype_class, alias) == NULL) {
+        if (npy_add_dtype_publication(
+                module, (PyObject *)dtype_class, alias) < 0) {
             goto fail;
         }
     }
     else {
         // ensure the within dtype cast is populated for legacy user dtypes
-        if (PyArray_GetCastingImpl(dtype_class, dtype_class) == NULL) {
+        PyObject *castingimpl = PyArray_GetCastingImpl(dtype_class, dtype_class);
+        if (castingimpl == NULL) {
             goto fail;
         }
+        Py_DECREF(castingimpl);
     }
 
+    /* The descriptor and published mappings own the class; return borrowed. */
+    Py_DECREF(dtype_class);
     return dtype_class;
   fail:
     Py_DECREF(dtype_class);
@@ -1381,102 +1458,60 @@ static PyMemberDef dtypemeta_members[] = {
     {NULL, 0, 0, 0, NULL},
 };
 
-NPY_NO_EXPORT void
-initialize_legacy_dtypemeta_aliases(_PyArray_LegacyDescr **_builtin_descrs) {
-    _Bool_dtype = NPY_DTYPE(_builtin_descrs[NPY_BOOL]);
-    _Byte_dtype = NPY_DTYPE(_builtin_descrs[NPY_BYTE]);
-    _UByte_dtype = NPY_DTYPE(_builtin_descrs[NPY_UBYTE]);
-    _Short_dtype = NPY_DTYPE(_builtin_descrs[NPY_SHORT]);
-    _UShort_dtype = NPY_DTYPE(_builtin_descrs[NPY_USHORT]);
-    _Int_dtype = NPY_DTYPE(_builtin_descrs[NPY_INT]);
-    _UInt_dtype = NPY_DTYPE(_builtin_descrs[NPY_UINT]);
-    _Long_dtype = NPY_DTYPE(_builtin_descrs[NPY_LONG]);
-    _ULong_dtype = NPY_DTYPE(_builtin_descrs[NPY_ULONG]);
-    _LongLong_dtype = NPY_DTYPE(_builtin_descrs[NPY_LONGLONG]);
-    _ULongLong_dtype = NPY_DTYPE(_builtin_descrs[NPY_ULONGLONG]);
-    _Int8_dtype = NPY_DTYPE(_builtin_descrs[NPY_INT8]);
-    _UInt8_dtype = NPY_DTYPE(_builtin_descrs[NPY_UINT8]);
-    _Int16_dtype = NPY_DTYPE(_builtin_descrs[NPY_INT16]);
-    _UInt16_dtype = NPY_DTYPE(_builtin_descrs[NPY_UINT16]);
-    _Int32_dtype = NPY_DTYPE(_builtin_descrs[NPY_INT32]);
-    _UInt32_dtype = NPY_DTYPE(_builtin_descrs[NPY_UINT32]);
-    _Int64_dtype = NPY_DTYPE(_builtin_descrs[NPY_INT64]);
-    _UInt64_dtype = NPY_DTYPE(_builtin_descrs[NPY_UINT64]);
-    _Intp_dtype = NPY_DTYPE(_builtin_descrs[NPY_INTP]);
-    _UIntp_dtype = NPY_DTYPE(_builtin_descrs[NPY_UINTP]);
-    _DefaultInt_dtype = NPY_DTYPE(_builtin_descrs[NPY_DEFAULT_INT]);
-    _Half_dtype = NPY_DTYPE(_builtin_descrs[NPY_HALF]);
-    _Float_dtype = NPY_DTYPE(_builtin_descrs[NPY_FLOAT]);
-    _Double_dtype = NPY_DTYPE(_builtin_descrs[NPY_DOUBLE]);
-    _LongDouble_dtype = NPY_DTYPE(_builtin_descrs[NPY_LONGDOUBLE]);
-    _CFloat_dtype = NPY_DTYPE(_builtin_descrs[NPY_CFLOAT]);
-    _CDouble_dtype = NPY_DTYPE(_builtin_descrs[NPY_CDOUBLE]);
-    _CLongDouble_dtype = NPY_DTYPE(_builtin_descrs[NPY_CLONGDOUBLE]);
-    // NPY_STRING is the legacy python2 name
-    _Bytes_dtype = NPY_DTYPE(_builtin_descrs[NPY_STRING]);
-    _Unicode_dtype = NPY_DTYPE(_builtin_descrs[NPY_UNICODE]);
-    _Datetime_dtype = NPY_DTYPE(_builtin_descrs[NPY_DATETIME]);
-    _Timedelta_dtype = NPY_DTYPE(_builtin_descrs[NPY_TIMEDELTA]);
-    _Object_dtype = NPY_DTYPE(_builtin_descrs[NPY_OBJECT]);
-    _Void_dtype = NPY_DTYPE(_builtin_descrs[NPY_VOID]);
+NPY_NO_EXPORT PyArray_DTypeMeta *
+_npy_get_legacy_dtype(int type_num)
+{
+    assert(0 <= type_num && type_num < NPY_NTYPES_LEGACY);
+    return NPY_DTYPE(_npy_module_state->builtin_descrs[type_num]);
 }
 
-NPY_NO_EXPORT PyTypeObject PyArrayDTypeMeta_Type = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "numpy._DTypeMeta",
-    .tp_basicsize = sizeof(PyArray_DTypeMeta),
-    .tp_dealloc = (destructor)dtypemeta_dealloc,
+static PyType_Slot dtypemeta_slots[] = {
+    {Py_tp_dealloc, dtypemeta_dealloc},
+    {Py_tp_doc, "Preliminary NumPy API: The Type of NumPy DTypes (metaclass)"},
+    {Py_tp_traverse, dtypemeta_traverse},
+    {Py_tp_clear, dtypemeta_clear},
+    {Py_tp_members, dtypemeta_members},
+    {Py_tp_getset, dtypemeta_getset},
+    {Py_tp_is_gc, dtypemeta_is_gc},
+    {0, NULL},
+};
+
+static PyType_Spec dtypemeta_spec = {
+    .name = "numpy._DTypeMeta",
+    .basicsize = sizeof(PyArray_DTypeMeta),
     /*
      * Types are garbage collected (see dtypemeta_is_gc documentation).
      * ``Py_TPFLAGS_DISALLOW_INSTANTIATION`` blocks Python-level subclassing;
      * a custom ``tp_new`` is not allowed because ``PyType_FromMetaclass``
      * forbids it on the metaclass.
      */
-    .tp_flags = (Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC
-                 | Py_TPFLAGS_DISALLOW_INSTANTIATION),
-    .tp_doc = "Preliminary NumPy API: The Type of NumPy DTypes (metaclass)",
-    .tp_traverse = (traverseproc)dtypemeta_traverse,
-    .tp_members = dtypemeta_members,
-    .tp_getset = dtypemeta_getset,
-    .tp_base = NULL,  /* set to PyType_Type at import time */
-    .tp_is_gc = dtypemeta_is_gc,
+    .flags = (Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC
+              | Py_TPFLAGS_DISALLOW_INSTANTIATION | Py_TPFLAGS_IMMUTABLETYPE),
+    .slots = dtypemeta_slots,
 };
 
-PyArray_DTypeMeta *_Bool_dtype = NULL;
-PyArray_DTypeMeta *_Byte_dtype = NULL;
-PyArray_DTypeMeta *_UByte_dtype = NULL;
-PyArray_DTypeMeta *_Short_dtype = NULL;
-PyArray_DTypeMeta *_UShort_dtype = NULL;
-PyArray_DTypeMeta *_Int_dtype = NULL;
-PyArray_DTypeMeta *_UInt_dtype = NULL;
-PyArray_DTypeMeta *_Long_dtype = NULL;
-PyArray_DTypeMeta *_ULong_dtype = NULL;
-PyArray_DTypeMeta *_LongLong_dtype = NULL;
-PyArray_DTypeMeta *_ULongLong_dtype = NULL;
-PyArray_DTypeMeta *_Int8_dtype = NULL;
-PyArray_DTypeMeta *_UInt8_dtype = NULL;
-PyArray_DTypeMeta *_Int16_dtype = NULL;
-PyArray_DTypeMeta *_UInt16_dtype = NULL;
-PyArray_DTypeMeta *_Int32_dtype = NULL;
-PyArray_DTypeMeta *_UInt32_dtype = NULL;
-PyArray_DTypeMeta *_Int64_dtype = NULL;
-PyArray_DTypeMeta *_UInt64_dtype = NULL;
-PyArray_DTypeMeta *_Intp_dtype = NULL;
-PyArray_DTypeMeta *_UIntp_dtype = NULL;
-PyArray_DTypeMeta *_DefaultInt_dtype = NULL;
-PyArray_DTypeMeta *_Half_dtype = NULL;
-PyArray_DTypeMeta *_Float_dtype = NULL;
-PyArray_DTypeMeta *_Double_dtype = NULL;
-PyArray_DTypeMeta *_LongDouble_dtype = NULL;
-PyArray_DTypeMeta *_CFloat_dtype = NULL;
-PyArray_DTypeMeta *_CDouble_dtype = NULL;
-PyArray_DTypeMeta *_CLongDouble_dtype = NULL;
-PyArray_DTypeMeta *_Bytes_dtype = NULL;
-PyArray_DTypeMeta *_Unicode_dtype = NULL;
-PyArray_DTypeMeta *_Datetime_dtype = NULL;
-PyArray_DTypeMeta *_Timedelta_dtype = NULL;
-PyArray_DTypeMeta *_Object_dtype = NULL;
-PyArray_DTypeMeta *_Void_dtype = NULL;
+NPY_NO_EXPORT PyTypeObject *
+_npy_get_dtype_meta_type(void)
+{
+    return _npy_module_state->_dtype_meta_type;
+}
+
+NPY_NO_EXPORT int
+init_dtype_meta_type(PyObject *module)
+{
+    PyObject *bases = PyTuple_Pack(1, (PyObject *)&PyType_Type);
+    if (bases == NULL) {
+        return -1;
+    }
+    PyObject *type = PyType_FromModuleAndSpec(module, &dtypemeta_spec, bases);
+    Py_DECREF(bases);
+    if (type == NULL) {
+        return -1;
+    }
+    get_module_state(module)->_dtype_meta_type = (PyTypeObject *)type;
+    return 0;
+}
+
 
 
 

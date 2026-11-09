@@ -198,10 +198,18 @@ typedef struct PyVoidScalarObject PyVoidScalarObject;
    are defined in ndarrayobject.h
 */
 
+#if defined(_MULTIARRAYMODULE)
+/* Core uses the owning interpreter's objects, independent of legacy slot 9. */
+NPY_NO_EXPORT PyObject *_npy_get_bool_scalar(npy_bool value);
+#define PyArrayScalar_False (_npy_get_bool_scalar(0))
+#define PyArrayScalar_True (_npy_get_bool_scalar(1))
+#define PyArrayScalar_FromLong(i) (_npy_get_bool_scalar((i) != 0))
+#else
 #define PyArrayScalar_False ((PyObject *)(&(_PyArrayScalar_BoolValues[0])))
 #define PyArrayScalar_True ((PyObject *)(&(_PyArrayScalar_BoolValues[1])))
 #define PyArrayScalar_FromLong(i) \
         ((PyObject *)(&(_PyArrayScalar_BoolValues[((i)!=0)])))
+#endif
 #define PyArrayScalar_RETURN_BOOL_FROM_LONG(i) do {     \
         PyObject *obj = PyArrayScalar_FromLong(i);      \
         Py_INCREF(obj);                                 \

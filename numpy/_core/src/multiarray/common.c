@@ -19,6 +19,7 @@
 #include "mem_overlap.h"
 #include "array_coercion.h"
 #include "alloc.h"  /* for npy_alloc_cache_dim */
+#include "module_state.h"
 
 /*
  * The casting to use for implicit assignment operations resulting from
@@ -26,7 +27,11 @@
  * variable is misnamed, but it's part of the public API so I'm not sure we
  * can just change it. Maybe someone should try and see if anyone notices.
  */
-NPY_NO_EXPORT NPY_CASTING NPY_DEFAULT_ASSIGN_CASTING = NPY_SAME_KIND_CASTING;
+NPY_NO_EXPORT NPY_CASTING *
+_npy_get_default_assign_casting(void)
+{
+    return &_npy_module_state->default_assign_casting;
+}
 
 
 NPY_NO_EXPORT PyArray_Descr *

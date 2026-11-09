@@ -434,11 +434,12 @@ PyDataMem_Handler default_handler = {
         default_free     /* free */
     }
 };
-/*
- * Singleton capsule of the default handler. Stays process-global, it is a
- * public C-API slot (numpy_api.py, slot 306).
- */
-PyObject *PyDataMem_DefaultHandler;
+/* The public slot306 refers to this module's capsule field. */
+NPY_NO_EXPORT PyObject **
+_npy_get_default_mem_handler(void)
+{
+    return &_npy_module_state->default_mem_handler;
+}
 
 /* Wrappers for the default or any user-assigned PyDataMem_Handler */
 

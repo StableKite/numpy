@@ -23,6 +23,7 @@
 #include "conversion_utils.h"  /* for PyArray_TypestrConvert */
 #include "templ_common.h" /* for npy_mul_sizes_with_overflow */
 #include "descriptor.h"
+#include "hashdescr.h"
 #include "npy_static_data.h"
 #include "module_state.h"
 #include "multiarraymodule.h"  // for thread unsafe state access
@@ -1975,6 +1976,65 @@ fail:
  * allocated).
  */
 
+/* Layout and owned references remain valid until physical destruction.
+ * GC may clear a referenced fields dictionary independently; owning arrays
+ * retain a native reference plan for their data. */
+static int
+arraydescr_traverse(PyArray_Descr *self, visitproc visit, void *arg)
+{
+    PyTypeObject *base = Py_TYPE(self);
+    while (base->tp_traverse != (traverseproc)arraydescr_traverse) {
+        base = base->tp_base;
+        assert(base != NULL);
+    }
+    if (base->tp_flags & Py_TPFLAGS_HEAPTYPE) {
+        Py_VISIT(Py_TYPE(self));
+    }
+    Py_VISIT(self->typeobj);
+    Py_VISIT(self->metadata);
+    if (PyDataType_ISLEGACY(self)) {
+        _PyArray_LegacyDescr *legacy = (_PyArray_LegacyDescr *)self;
+        Py_VISIT(legacy->fields);
+        Py_VISIT(legacy->names);
+        if (legacy->subarray != NULL) {
+            Py_VISIT(legacy->subarray->base);
+            Py_VISIT(legacy->subarray->shape);
+        }
+    }
+    return 0;
+}
+
+static int
+arraydescr_clear(PyArray_Descr *self)
+{
+    /* Mutable containers can break their own cycles. Keep the scalar class
+     * and layout usable by any array still releasing its native data. */
+    Py_CLEAR(self->metadata);
+    return 0;
+}
+
+NPY_NO_EXPORT _PyArray_LegacyDescr *
+npy_alloc_legacy_descr(PyTypeObject *type, npy_bool zeroed)
+{
+    if (type->tp_flags & Py_TPFLAGS_HAVE_GC) {
+        if (type->tp_basicsize < (Py_ssize_t)sizeof(_PyArray_LegacyDescr)) {
+            PyErr_SetString(PyExc_TypeError, "GC legacy descriptor layout is too small");
+            return NULL;
+        }
+        return (_PyArray_LegacyDescr *)type->tp_alloc(type, 0);
+    }
+    if (!zeroed) {
+        return PyObject_New(_PyArray_LegacyDescr, type);
+    }
+    _PyArray_LegacyDescr *descr = PyObject_Calloc(1, sizeof(*descr));
+    if (descr == NULL) {
+        return (_PyArray_LegacyDescr *)PyErr_NoMemory();
+    }
+    PyObject_Init((PyObject *)descr, type);
+    return descr;
+}
+
+
 /*NUMPY_API
  * base cannot be NULL
  */
@@ -1991,7 +2051,7 @@ PyArray_DescrNew(PyArray_Descr *base_descr)
         return NULL;
     }
     _PyArray_LegacyDescr *base = (_PyArray_LegacyDescr *)base_descr;
-    _PyArray_LegacyDescr *newdescr = PyObject_New(_PyArray_LegacyDescr, Py_TYPE(base));
+    _PyArray_LegacyDescr *newdescr = npy_alloc_legacy_descr(Py_TYPE(base), NPY_FALSE);
 
     if (newdescr == NULL) {
         return NULL;
@@ -2001,69 +2061,64 @@ PyArray_DescrNew(PyArray_Descr *base_descr)
            (char *)base + offsetof(_PyArray_LegacyDescr, typeobj),
            sizeof(_PyArray_LegacyDescr) - offsetof(_PyArray_LegacyDescr, typeobj));
 
-    /*
-     * The c_metadata has a by-value ownership model, need to clone it
-     * (basically a deep copy, but the auxdata clone function has some
-     * flexibility still) so the new PyArray_Descr object owns
-     * a copy of the data. Having both 'base' and 'newdescr' point to
-     * the same auxdata pointer would cause a double-free of memory.
-     */
+    /* Only owned references may be released if a later allocation fails. */
+    newdescr->typeobj = (PyTypeObject *)Py_XNewRef(base->typeobj);
+    newdescr->metadata = Py_XNewRef(base->metadata);
+    newdescr->fields = base->fields == Py_None ? NULL : Py_XNewRef(base->fields);
+    newdescr->names = Py_XNewRef(base->names);
+    newdescr->subarray = NULL;
+    newdescr->c_metadata = NULL;
+    newdescr->hash = -1;
+
+    /* c_metadata is owned by value, unlike the Python references above. */
     if (base->c_metadata != NULL) {
         newdescr->c_metadata = NPY_AUXDATA_CLONE(base->c_metadata);
         if (newdescr->c_metadata == NULL) {
-            PyErr_NoMemory();
-            /* TODO: This seems wrong, as the old fields get decref'd? */
+            if (!PyErr_Occurred()) {
+                PyErr_NoMemory();
+            }
             Py_DECREF(newdescr);
             return NULL;
         }
     }
 
-    if (newdescr->fields == Py_None) {
-        newdescr->fields = NULL;
-    }
-    Py_XINCREF(newdescr->fields);
-    Py_XINCREF(newdescr->names);
-    if (newdescr->subarray) {
-        newdescr->subarray = PyArray_malloc(sizeof(PyArray_ArrayDescr));
+    if (base->subarray != NULL) {
+        newdescr->subarray = PyMem_RawMalloc(sizeof(PyArray_ArrayDescr));
         if (newdescr->subarray == NULL) {
             Py_DECREF(newdescr);
             return (PyArray_Descr *)PyErr_NoMemory();
         }
-        memcpy(newdescr->subarray, base->subarray, sizeof(PyArray_ArrayDescr));
-        Py_INCREF(newdescr->subarray->shape);
-        Py_INCREF(newdescr->subarray->base);
+        newdescr->subarray->shape = Py_NewRef(base->subarray->shape);
+        newdescr->subarray->base = (PyArray_Descr *)Py_NewRef(base->subarray->base);
     }
-    Py_XINCREF(newdescr->typeobj);
-    Py_XINCREF(newdescr->metadata);
-    newdescr->hash = -1;
 
     return (PyArray_Descr *)newdescr;
 }
 
-/*
- * should never be called for builtin-types unless
- * there is a reference-count problem
- */
 static void
 arraydescr_dealloc(PyArray_Descr *self)
 {
+    if (PyObject_GC_IsTracked((PyObject *)self)) {
+        PyObject_GC_UnTrack(self);
+    }
+    PyTypeObject *type = Py_TYPE(self);
+    PyTypeObject *base = type;
+    while (base->tp_dealloc != (destructor)arraydescr_dealloc) {
+        base = base->tp_base;
+        assert(base != NULL);
+    }
+    int base_is_heap = base->tp_flags & Py_TPFLAGS_HEAPTYPE;
     Py_XDECREF(self->typeobj);
     if (!PyDataType_ISLEGACY(self)) {
         /* non legacy dtypes must not have fields, etc. */
-        Py_TYPE(self)->tp_free((PyObject *)self);
+        type->tp_free((PyObject *)self);
+        if (base_is_heap) {
+            Py_DECREF(type);
+        }
         return;
     }
     _PyArray_LegacyDescr *lself = (_PyArray_LegacyDescr *)self;
 
-    if (lself->fields == Py_None) {
-        fprintf(stderr, "*** Reference count error detected: "
-                "an attempt was made to deallocate the dtype %d (%c) ***\n",
-                self->type_num, self->type);
-        assert(0);
-        Py_INCREF(self);
-        Py_INCREF(self);
-        return;
-    }
     Py_XDECREF(lself->names);
     Py_XDECREF(lself->fields);
     if (lself->subarray) {
@@ -2077,9 +2132,9 @@ arraydescr_dealloc(PyArray_Descr *self)
          * stealing the link is unobservable and each node still runs
          * its own, now shallow, dealloc.
          *
-         * If descriptors ever get the Py_TPFLAGS_HAVE_GC flag, we can
-         * use CPython's stack protection via the trashcan macros
-         * instead.
+         * GC descriptor nodes use ordinary DECREF instead. CPython 3.15
+         * automatically defers GC deallocation when the C stack is low;
+         * its legacy trashcan macros are no-ops.
          */
         PyArray_Descr *base = lself->subarray->base;
         PyArray_free(lself->subarray);
@@ -2091,7 +2146,8 @@ arraydescr_dealloc(PyArray_Descr *self)
          * PyUnstable_Object_IsUniquelyReferenced because that excludes
          * objects on remote threads.
          */
-        while (base != NULL && Py_REFCNT(base) == 1 && PyDataType_HASSUBARRAY(base)) {
+        while (base != NULL && !PyObject_IS_GC((PyObject *)base)
+                && Py_REFCNT(base) == 1 && PyDataType_HASSUBARRAY(base)) {
             _PyArray_LegacyDescr *lbase = (_PyArray_LegacyDescr *)base;
             // steal reference owned by lbase and stash it in base
             // (Py_CLEAR without a DECREF)
@@ -2106,7 +2162,10 @@ arraydescr_dealloc(PyArray_Descr *self)
     Py_XDECREF(lself->metadata);
     NPY_AUXDATA_FREE(lself->c_metadata);
     lself->c_metadata = NULL;
-    Py_TYPE(self)->tp_free((PyObject *)self);
+    type->tp_free((PyObject *)self);
+    if (base_is_heap) {
+        Py_DECREF(type);
+    }
 }
 
 /*
@@ -3644,10 +3703,6 @@ descr_nonzero(PyObject *NPY_UNUSED(self))
     return 1;
 }
 
-static PyNumberMethods descr_as_number = {
-    .nb_bool = (inquiry)descr_nonzero,
-};
-
 /*************************************************************************
  ****************   Implement Mapping Protocol ***************************
  *************************************************************************/
@@ -3908,44 +3963,44 @@ array_protocol_descr_get(PyArray_Descr *self)
 }
 
 
-static PySequenceMethods descr_as_sequence = {
-    (lenfunc) descr_length,                  /* sq_length */
-    (binaryfunc) NULL,                       /* sq_concat */
-    (ssizeargfunc) descr_repeat,             /* sq_repeat */
-    (ssizeargfunc) NULL,                     /* sq_item */
-    (ssizessizeargfunc) NULL,                /* sq_slice */
-    (ssizeobjargproc) NULL,                  /* sq_ass_item */
-    (ssizessizeobjargproc) NULL,             /* sq_ass_slice */
-    (objobjproc) NULL,                       /* sq_contains */
-    (binaryfunc) NULL,                       /* sq_inplace_concat */
-    (ssizeargfunc) NULL,                     /* sq_inplace_repeat */
-};
-
-static PyMappingMethods descr_as_mapping = {
-    descr_length,                                /* mp_length*/
-    (binaryfunc)descr_subscript,                 /* mp_subscript*/
-    (objobjargproc)NULL,                         /* mp_ass_subscript*/
-};
-
 /****************** End of Mapping Protocol ******************************/
 
 
 /*
- * NOTE: Since this is a MetaClass, the name has Full appended here, the
- *       correct name of the type is PyArrayDescr_Type.
+ * Existing binary extensions may statically allocate subclasses of
+ * PyArrayDescr_Type. CPython does not allow such a type to have a heap base.
+ * Keep this object exclusively in the main interpreter for that ABI; child
+ * interpreters use the module-owned heap type defined below and never touch
+ * this object's Python references.
  */
-NPY_NO_EXPORT PyArray_DTypeMeta PyArrayDescr_TypeFull = {
+static PyNumberMethods main_descr_as_number = {
+    .nb_bool = descr_nonzero,
+};
+
+static PySequenceMethods main_descr_as_sequence = {
+    .sq_length = descr_length,
+    .sq_repeat = descr_repeat,
+};
+
+static PyMappingMethods main_descr_as_mapping = {
+    .mp_length = descr_length,
+    .mp_subscript = (binaryfunc)descr_subscript,
+};
+
+static PyArray_DTypeMeta main_descr_type = {
     {{
-        /* NULL represents `type`, this is set to DTypeMeta at import time */
         PyVarObject_HEAD_INIT(NULL, 0)
         .tp_name = "numpy.dtype",
         .tp_basicsize = sizeof(PyArray_Descr),
         .tp_dealloc = (destructor)arraydescr_dealloc,
+        .tp_traverse = (traverseproc)arraydescr_traverse,
+        .tp_clear = (inquiry)arraydescr_clear,
         .tp_repr = (reprfunc)arraydescr_repr,
-        .tp_as_number = &descr_as_number,
-        .tp_as_sequence = &descr_as_sequence,
-        .tp_as_mapping = &descr_as_mapping,
+        .tp_as_number = &main_descr_as_number,
+        .tp_as_sequence = &main_descr_as_sequence,
+        .tp_as_mapping = &main_descr_as_mapping,
         .tp_str = (reprfunc)arraydescr_str,
+        .tp_hash = PyArray_DescrHash,
         .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
         .tp_richcompare = (richcmpfunc)arraydescr_richcompare,
         .tp_methods = arraydescr_methods,
@@ -3953,8 +4008,70 @@ NPY_NO_EXPORT PyArray_DTypeMeta PyArrayDescr_TypeFull = {
         .tp_getset = arraydescr_getsets,
         .tp_new = arraydescr_new,
     },},
-    .singleton = NULL,
     .type_num = -1,
-    .scalar_type = NULL,
     .flags = NPY_DT_ABSTRACT,
 };
+
+static PyType_Slot descr_type_slots[] = {
+    {Py_tp_dealloc, arraydescr_dealloc},
+    {Py_tp_traverse, arraydescr_traverse},
+    {Py_tp_clear, arraydescr_clear},
+    {Py_tp_repr, arraydescr_repr},
+    {Py_nb_bool, descr_nonzero},
+    {Py_sq_length, descr_length},
+    {Py_sq_repeat, descr_repeat},
+    {Py_mp_length, descr_length},
+    {Py_mp_subscript, descr_subscript},
+    {Py_tp_str, arraydescr_str},
+    {Py_tp_hash, PyArray_DescrHash},
+    {Py_tp_richcompare, arraydescr_richcompare},
+    {Py_tp_methods, arraydescr_methods},
+    {Py_tp_members, arraydescr_members},
+    {Py_tp_getset, arraydescr_getsets},
+    {Py_tp_new, arraydescr_new},
+    {0, NULL},
+};
+
+static PyType_Spec descr_type_spec = {
+    .name = "numpy.dtype",
+    .basicsize = sizeof(PyArray_Descr),
+    .flags = (Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE
+              | Py_TPFLAGS_IMMUTABLETYPE),
+    .slots = descr_type_slots,
+};
+
+NPY_NO_EXPORT PyTypeObject *
+_npy_get_descr_type(void)
+{
+    return _npy_module_state->descr_type;
+}
+
+NPY_NO_EXPORT int
+init_descr_type(PyObject *module)
+{
+    if (PyInterpreterState_Get() == PyInterpreterState_Main()) {
+        PyTypeObject *type = (PyTypeObject *)&main_descr_type;
+        Py_INCREF(&PyArrayDTypeMeta_Type);
+        Py_SET_TYPE(type, &PyArrayDTypeMeta_Type);
+        if (PyType_Ready(type) < 0) {
+            return -1;
+        }
+        get_module_state(module)->descr_type =
+                (PyTypeObject *)Py_NewRef(type);
+        return 0;
+    }
+    PyType_Spec child_spec = descr_type_spec;
+    /* Prototypes exist before concrete legacy DTypes are wrapped. Give their
+     * temporary root the complete layout and correct GC allocator too. */
+    child_spec.basicsize = sizeof(_PyArray_LegacyDescr);
+    child_spec.flags |= Py_TPFLAGS_HAVE_GC;
+    PyArray_DTypeMeta *type = (PyArray_DTypeMeta *)PyType_FromMetaclass(
+            &PyArrayDTypeMeta_Type, module, &child_spec, NULL);
+    if (type == NULL) {
+        return -1;
+    }
+    type->type_num = -1;
+    type->flags = NPY_DT_ABSTRACT | NPY_DT_LEGACY;
+    get_module_state(module)->descr_type = (PyTypeObject *)type;
+    return 0;
+}

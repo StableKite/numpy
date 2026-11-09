@@ -18,6 +18,7 @@
 
 #include "alloc.h"
 #include "common.h"
+#include "module_state.h"
 #include "conversion_utils.h"
 #include "ctors.h"
 #include "npy_pycompat.h"
@@ -33,7 +34,7 @@ struct NewNpyArrayIterObject_tag {
     /* The iterator */
     NpyIter *iter;
     /* Flag indicating iteration started/stopped */
-    char started, finished;
+    char started, finished, closing;
     /* Child to update for nested iteration */
     NewNpyArrayIterObject *nested_child;
     /* Cached values from the iterator */
@@ -100,6 +101,7 @@ npyiter_new(PyTypeObject *subtype, PyObject *NPY_UNUSED(args),
         self->iter = NULL;
         self->nested_child = NULL;
         self->writeflags = NULL;
+        self->closing = 0;
     }
 
     return (PyObject *)self;
@@ -698,7 +700,7 @@ npyiter_init(NewNpyArrayIterObject *self, PyObject *args, PyObject *kwds)
 
     int res = -1;
 
-    if (self->iter != NULL) {
+    if (self->iter != NULL || self->closing) {
         PyErr_SetString(PyExc_ValueError,
                 "Iterator was already initialized");
         return -1;
@@ -1196,14 +1198,37 @@ finish:
 }
 
 
-static void
-npyiter_dealloc(NewNpyArrayIterObject *self)
+static int
+npyiter_traverse(NewNpyArrayIterObject *self, visitproc visit, void *arg)
 {
-    if (self->iter) {
-        /* Store error, so that WriteUnraisable cannot clear an existing one */
-        PyObject *exc, *val, *tb;
-        PyErr_Fetch(&exc, &val, &tb);
-        if (npyiter_has_writeback(self->iter)) {
+    Py_VISIT(Py_TYPE(self));
+    Py_VISIT(self->nested_child);
+    NpyIter *iter = self->iter;
+    if (iter != NULL) {
+        PyArrayObject **operands = NpyIter_GetOperandArray(iter);
+        PyArray_Descr **descriptors = NpyIter_GetDescrArray(iter);
+        for (int index = 0; index < NpyIter_GetNOp(iter); index++) {
+            Py_VISIT(operands[index]);
+            Py_VISIT(descriptors[index]);
+        }
+    }
+    return 0;
+}
+
+static int
+npyiter_clear(NewNpyArrayIterObject *self)
+{
+    NpyIter *iter = self->iter;
+    NewNpyArrayIterObject *child = self->nested_child;
+    /* Operand destruction and warning handlers may execute Python code. */
+    self->closing = 1;
+    self->iter = NULL;
+    self->nested_child = NULL;
+    /* Keep the caller's exception across every child/operand finalizer. */
+    PyObject *exc, *val, *tb;
+    PyErr_Fetch(&exc, &val, &tb);
+    if (iter) {
+        if (npyiter_has_writeback(iter)) {
             if (PyErr_WarnEx(PyExc_RuntimeWarning,
                     "Temporary data has not been written back to one of the "
                     "operands. Typically nditer is used as a context manager "
@@ -1221,16 +1246,24 @@ npyiter_dealloc(NewNpyArrayIterObject *self)
                 }
             }
         }
-        if (!NpyIter_Deallocate(self->iter)) {
+        if (!NpyIter_Deallocate(iter)) {
             PyErr_WriteUnraisable(Py_None);
         }
-        self->iter = NULL;
-        Py_XDECREF(self->nested_child);
-        self->nested_child = NULL;
-        PyErr_Restore(exc, val, tb);
     }
+    Py_XDECREF(child);
+    PyErr_Restore(exc, val, tb);
+    return 0;
+}
+
+static void
+npyiter_dealloc(NewNpyArrayIterObject *self)
+{
+    PyTypeObject *type = Py_TYPE(self);
+    PyObject_GC_UnTrack(self);
+    npyiter_clear(self);
     PyMem_Free(self->writeflags);
-    Py_TYPE(self)->tp_free((PyObject*)self);
+    type->tp_free((PyObject*)self);
+    Py_DECREF(type);
 }
 
 static int
@@ -2391,15 +2424,27 @@ npyiter_enter(NewNpyArrayIterObject *self, PyObject *NPY_UNUSED(args))
 static PyObject *
 npyiter_close(NewNpyArrayIterObject *self, PyObject *NPY_UNUSED(args))
 {
-    NpyIter *iter = self->iter;
+    NpyIter *iter;
+    NewNpyArrayIterObject *child = NULL;
     int ret;
-    if (self->iter == NULL) {
+    Py_BEGIN_CRITICAL_SECTION(self);
+    iter = self->iter;
+    if (iter != NULL) {
+        /* Detach before decrefs can re-enter close or iterator accessors. */
+        self->closing = 1;
+        self->iter = NULL;
+        child = self->nested_child;
+        self->nested_child = NULL;
+    }
+    Py_END_CRITICAL_SECTION();
+    if (iter == NULL) {
         Py_RETURN_NONE;
     }
     ret = NpyIter_Deallocate(iter);
-    self->iter = NULL;
-    Py_XDECREF(self->nested_child);
-    self->nested_child = NULL;
+    Py_XDECREF(child);
+    Py_BEGIN_CRITICAL_SECTION(self);
+    self->closing = 0;
+    Py_END_CRITICAL_SECTION();
     if (ret != NPY_SUCCEED) {
         return NULL;
     }
@@ -2511,37 +2556,44 @@ static PyGetSetDef npyiter_getsets[] = {
     {NULL, NULL, NULL, NULL, NULL}
 };
 
-NPY_NO_EXPORT PySequenceMethods npyiter_as_sequence = {
-    (lenfunc)npyiter_seq_length,            /*sq_length*/
-    (binaryfunc)NULL,                       /*sq_concat*/
-    (ssizeargfunc)NULL,                     /*sq_repeat*/
-    (ssizeargfunc)npyiter_seq_item,         /*sq_item*/
-    (ssizessizeargfunc)NULL,                /*sq_slice*/
-    (ssizeobjargproc)npyiter_seq_ass_item,  /*sq_ass_item*/
-    (ssizessizeobjargproc)NULL,             /*sq_ass_slice*/
-    (objobjproc)NULL,                       /*sq_contains */
-    (binaryfunc)NULL,                       /*sq_inplace_concat */
-    (ssizeargfunc)NULL,                     /*sq_inplace_repeat */
+static PyType_Slot nditer_slots[] = {
+    {Py_tp_dealloc, npyiter_dealloc},
+    {Py_tp_traverse, npyiter_traverse},
+    {Py_tp_clear, npyiter_clear},
+    {Py_sq_length, npyiter_seq_length},
+    {Py_sq_item, npyiter_seq_item},
+    {Py_sq_ass_item, npyiter_seq_ass_item},
+    {Py_mp_length, npyiter_seq_length},
+    {Py_mp_subscript, npyiter_subscript},
+    {Py_mp_ass_subscript, npyiter_ass_subscript},
+    {Py_tp_iter, PyObject_SelfIter},
+    {Py_tp_iternext, npyiter_next},
+    {Py_tp_methods, npyiter_methods},
+    {Py_tp_members, npyiter_members},
+    {Py_tp_getset, npyiter_getsets},
+    {Py_tp_init, npyiter_init},
+    {Py_tp_new, npyiter_new},
+    {0, NULL},
 };
 
-NPY_NO_EXPORT PyMappingMethods npyiter_as_mapping = {
-    (lenfunc)npyiter_seq_length,          /*mp_length*/
-    (binaryfunc)npyiter_subscript,        /*mp_subscript*/
-    (objobjargproc)npyiter_ass_subscript, /*mp_ass_subscript*/
+static PyType_Spec nditer_spec = {
+    .name = "numpy.nditer",
+    .basicsize = sizeof(NewNpyArrayIterObject),
+    .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_IMMUTABLETYPE | Py_TPFLAGS_HAVE_GC,
+    .slots = nditer_slots,
 };
 
-NPY_NO_EXPORT PyTypeObject NpyIter_Type = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "numpy.nditer",
-    .tp_basicsize = sizeof(NewNpyArrayIterObject),
-    .tp_dealloc = (destructor)npyiter_dealloc,
-    .tp_as_sequence = &npyiter_as_sequence,
-    .tp_as_mapping = &npyiter_as_mapping,
-    .tp_flags = Py_TPFLAGS_DEFAULT,
-    .tp_iternext = (iternextfunc)npyiter_next,
-    .tp_methods = npyiter_methods,
-    .tp_members = npyiter_members,
-    .tp_getset = npyiter_getsets,
-    .tp_init = (initproc)npyiter_init,
-    .tp_new = npyiter_new,
-};
+NPY_NO_EXPORT PyTypeObject *
+_npy_get_nditer_type(void)
+{
+    return _npy_module_state->nditer_type;
+}
+
+NPY_NO_EXPORT int
+init_nditer_type(PyObject *module)
+{
+    multiarray_umath_state *state = get_module_state(module);
+    state->nditer_type = (PyTypeObject *)PyType_FromModuleAndSpec(
+            module, &nditer_spec, NULL);
+    return state->nditer_type == NULL ? -1 : 0;
+}

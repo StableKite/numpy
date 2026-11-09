@@ -34,7 +34,11 @@
 #include "convert_datatype.h"
 #include "legacy_dtype_implementation.h"
 
-NPY_NO_EXPORT int NPY_NUMUSERTYPES = 0;
+NPY_NO_EXPORT int *
+_npy_get_num_user_types(void)
+{
+    return &_npy_module_state->num_user_types;
+}
 
 /* Internal APIs */
 #include "alloc.h"
@@ -63,6 +67,7 @@ NPY_NO_EXPORT int NPY_NUMUSERTYPES = 0;
 #include "datetime_busday.h"
 #include "datetime_busdaycal.h"
 #include "item_selection.h"
+#include "iterators.h"
 #include "shape.h"
 #include "ctors.h"
 #include "array_assign.h"
@@ -95,7 +100,6 @@ NPY_NO_EXPORT int NPY_NUMUSERTYPES = 0;
 /* __ufunc_api.c define is the PyUFunc_API table: */
 #include "__ufunc_api.c"
 
-NPY_NO_EXPORT int initscalarmath(PyObject *);
 NPY_NO_EXPORT int set_matmul_flags(PyObject *d); /* in ufunc_object.c */
 /* From umath/string_ufuncs.cpp/h */
 NPY_NO_EXPORT PyObject *
@@ -4592,6 +4596,10 @@ static PyObject *
 _reload_guard(PyObject *self, PyObject *NPY_UNUSED(args)) {
     multiarray_umath_state *state = get_module_state(self);
     if (PyThreadState_Get()->interp != PyInterpreterState_Main()) {
+#if PY_VERSION_HEX >= 0x030f0000
+        state->global_state.reload_guard_initialized = 1;
+        Py_RETURN_NONE;
+#else
         if (PyErr_WarnEx(PyExc_UserWarning,
                 "NumPy was imported from a Python sub-interpreter but "
                 "NumPy does not properly support sub-interpreters. "
@@ -4607,6 +4615,7 @@ _reload_guard(PyObject *self, PyObject *NPY_UNUSED(args)) {
         /* No need to give the other warning in a sub-interpreter as well... */
         state->global_state.reload_guard_initialized = 1;
         Py_RETURN_NONE;
+#endif
     }
     if (state->global_state.reload_guard_initialized) {
         if (PyErr_WarnEx(PyExc_UserWarning,
@@ -4621,7 +4630,39 @@ _reload_guard(PyObject *self, PyObject *NPY_UNUSED(args)) {
 }
 
 
+/* Ordinary old C clients must never borrow a child interpreter's tables.
+ * Prepared modules use the versioned owner-bearing context capsule instead. */
+static PyObject *
+npy_legacy_api_getattr(PyObject *self, PyObject *name)
+{
+    if (PyUnicode_Check(name) &&
+            (PyUnicode_CompareWithASCIIString(name, "_ARRAY_API") == 0 ||
+             PyUnicode_CompareWithASCIIString(name, "_UFUNC_API") == 0) &&
+            PyInterpreterState_Get() != PyInterpreterState_Main()) {
+        PyErr_SetString(PyExc_ImportError,
+                "The legacy NumPy C API is unavailable in subinterpreters; "
+                "this extension must use the interpreter-owned NumPy context API");
+        return NULL;
+    }
+    PyErr_Format(PyExc_AttributeError,
+            "module 'numpy._core._multiarray_umath' has no attribute '%U'", name);
+    return NULL;
+}
+
+#if PY_VERSION_HEX >= 0x030d0000
+/* Read-only physical context count: a closed child must unregister its state. */
+static PyObject *
+npy_context_registry_size(PyObject *self, PyObject *NPY_UNUSED(args))
+{
+    return PyLong_FromSize_t(npy_module_state_registry_size());
+}
+#endif
+
 static struct PyMethodDef array_module_methods[] = {
+    {"__getattr__", npy_legacy_api_getattr, METH_O, NULL},
+#if PY_VERSION_HEX >= 0x030d0000
+    {"_get_context_registry_size", npy_context_registry_size, METH_NOARGS, NULL},
+#endif
     {"_get_implementing_args",
         (PyCFunction)array__get_implementing_args,
         METH_VARARGS, NULL},
@@ -4846,6 +4887,7 @@ static struct PyMethodDef array_module_methods[] = {
 };
 
 #include "__multiarray_api.c"
+#include "numpy/interpreter_context.h"
 #include "array_method.h"
 
 /* Establish scalar-type hierarchy
@@ -4886,18 +4928,20 @@ setup_scalartypes(PyObject *NPY_UNUSED(dict))
         return -1;                                                      \
     }
 
-    if (PyType_Ready(&PyGenericArrType_Type) < 0) {
-        return -1;
+    if (PyInterpreterState_Get() == PyInterpreterState_Main()) {
+        if (PyType_Ready(&PyGenericArrType_Type) < 0) {
+            return -1;
+        }
+        SINGLE_INHERIT(Number, Generic);
+        SINGLE_INHERIT(Integer, Number);
+        SINGLE_INHERIT(Inexact, Number);
+        SINGLE_INHERIT(SignedInteger, Integer);
+        SINGLE_INHERIT(UnsignedInteger, Integer);
+        SINGLE_INHERIT(Floating, Inexact);
+        SINGLE_INHERIT(ComplexFloating, Inexact);
+        SINGLE_INHERIT(Flexible, Generic);
+        SINGLE_INHERIT(Character, Flexible);
     }
-    SINGLE_INHERIT(Number, Generic);
-    SINGLE_INHERIT(Integer, Number);
-    SINGLE_INHERIT(Inexact, Number);
-    SINGLE_INHERIT(SignedInteger, Integer);
-    SINGLE_INHERIT(UnsignedInteger, Integer);
-    SINGLE_INHERIT(Floating, Inexact);
-    SINGLE_INHERIT(ComplexFloating, Inexact);
-    SINGLE_INHERIT(Flexible, Generic);
-    SINGLE_INHERIT(Character, Flexible);
 
 #define DUAL_INHERIT(child, parent1, parent2)                           \
     Py##child##ArrType_Type.tp_base = &Py##parent2##ArrType_Type;       \
@@ -4929,39 +4973,37 @@ setup_scalartypes(PyObject *NPY_UNUSED(dict))
         return -1;                                                      \
     }
 
-    SINGLE_INHERIT(Bool, Generic);
-    SINGLE_INHERIT(Byte, SignedInteger);
-    SINGLE_INHERIT(Short, SignedInteger);
-    SINGLE_INHERIT(Int, SignedInteger);
-    SINGLE_INHERIT(Long, SignedInteger);
-    SINGLE_INHERIT(LongLong, SignedInteger);
+    if (PyInterpreterState_Get() == PyInterpreterState_Main()) {
+        SINGLE_INHERIT(Bool, Generic);
+        SINGLE_INHERIT(Byte, SignedInteger);
+        SINGLE_INHERIT(Short, SignedInteger);
+        SINGLE_INHERIT(Int, SignedInteger);
+        SINGLE_INHERIT(Long, SignedInteger);
+        SINGLE_INHERIT(LongLong, SignedInteger);
 
-    /* Datetime doesn't fit in any category */
-    SINGLE_INHERIT(Datetime, Generic);
-    /* Timedelta is an integer with an associated unit */
-    SINGLE_INHERIT(Timedelta, SignedInteger);
+        SINGLE_INHERIT(Datetime, Generic);
+        SINGLE_INHERIT(Timedelta, SignedInteger);
 
-    SINGLE_INHERIT(UByte, UnsignedInteger);
-    SINGLE_INHERIT(UShort, UnsignedInteger);
-    SINGLE_INHERIT(UInt, UnsignedInteger);
-    SINGLE_INHERIT(ULong, UnsignedInteger);
-    SINGLE_INHERIT(ULongLong, UnsignedInteger);
+        SINGLE_INHERIT(UByte, UnsignedInteger);
+        SINGLE_INHERIT(UShort, UnsignedInteger);
+        SINGLE_INHERIT(UInt, UnsignedInteger);
+        SINGLE_INHERIT(ULong, UnsignedInteger);
+        SINGLE_INHERIT(ULongLong, UnsignedInteger);
 
-    SINGLE_INHERIT(Half, Floating);
-    SINGLE_INHERIT(Float, Floating);
-    DUAL_INHERIT(Double, Float, Floating);
-    SINGLE_INHERIT(LongDouble, Floating);
+        SINGLE_INHERIT(Half, Floating);
+        SINGLE_INHERIT(Float, Floating);
+        DUAL_INHERIT(Double, Float, Floating);
+        SINGLE_INHERIT(LongDouble, Floating);
 
-    SINGLE_INHERIT(CFloat, ComplexFloating);
-    DUAL_INHERIT(CDouble, Complex, ComplexFloating);
-    SINGLE_INHERIT(CLongDouble, ComplexFloating);
+        SINGLE_INHERIT(CFloat, ComplexFloating);
+        DUAL_INHERIT(CDouble, Complex, ComplexFloating);
+        SINGLE_INHERIT(CLongDouble, ComplexFloating);
 
-    DUAL_INHERIT2(String, Bytes, Character);
-    DUAL_INHERIT2(Unicode, Unicode, Character);
-
-    SINGLE_INHERIT(Void, Flexible);
-
-    SINGLE_INHERIT(Object, Generic);
+        DUAL_INHERIT2(String, Bytes, Character);
+        DUAL_INHERIT2(Unicode, Unicode, Character);
+        SINGLE_INHERIT(Void, Flexible);
+        SINGLE_INHERIT(Object, Generic);
+    }
 
     return 0;
 
@@ -5012,7 +5054,9 @@ set_flaginfo(PyObject *d)
     return;
 }
 
+#if PY_VERSION_HEX < 0x030d0000
 NPY_VISIBILITY_HIDDEN multiarray_umath_state *_npy_module_state = NULL;
+#endif
 
 static int
 initialize_global_state(multiarray_umath_state *state) {
@@ -5027,37 +5071,35 @@ initialize_global_state(multiarray_umath_state *state) {
     return 0;
 }
 
+#if PY_VERSION_HEX < 0x030d0000
 static int module_loaded = 0;
-
-/*
- * The module state is never torn down: the static types and the PyArray_API
- * table keep using objects it holds.  Hence the 1 branch, where the slots are
- * no-ops so an unbalanced Py_DECREF cannot clear the state either.  Switch to
- * 0 once the state can be torn down.
- */
-#if 1
-static int
-multiarray_umath_traverse(PyObject *NPY_UNUSED(m), visitproc NPY_UNUSED(visit),
-                          void *NPY_UNUSED(arg))
-{
-    return 0;
-}
-
-static int
-multiarray_umath_clear(PyObject *NPY_UNUSED(m))
-{
-    return 0;
-}
+#endif
 
 static void
-multiarray_umath_free(void *NPY_UNUSED(m))
+clear_user_types(multiarray_umath_state *state)
 {
+    _PyArray_LegacyDescr **descrs = state->user_descrs;
+    int count = state->num_user_types;
+    state->user_descrs = NULL;
+    state->num_user_types = 0;
+    for (int i = 0; i < count; i++) {
+        Py_XDECREF(descrs[i]);
+    }
+    PyMem_RawFree(descrs);
 }
-#else
+
+/* A child context owns native state independently of module object storage.
+ * Main retains its original compatibility lifetime. No process-wide Python
+ * reference owns a child context; registry entries only borrow C pointers. */
+typedef struct {
+    PyObject_HEAD
+    int64_t interpreter_id;
+    multiarray_umath_state state;
+} npy_native_state_owner;
+
 static int
-multiarray_umath_traverse(PyObject *m, visitproc visit, void *arg)
+native_state_traverse(multiarray_umath_state *state, visitproc visit, void *arg)
 {
-    multiarray_umath_state *state = get_module_state(m);
 
 #define NPY_VISIT_FIELD(name) Py_VISIT(state->interned_str.name);
     NPY_INTERNED_STR_FIELDS(NPY_VISIT_FIELD)
@@ -5076,26 +5118,29 @@ multiarray_umath_traverse(PyObject *m, visitproc visit, void *arg)
 
 #define NPY_VISIT_FIELD(name) Py_VISIT(state->name);
     NPY_MODULE_STATE_OBJECT_FIELDS(NPY_VISIT_FIELD)
+    NPY_MODULE_STATE_TYPE_FIELDS(NPY_VISIT_FIELD)
 #undef NPY_VISIT_FIELD
 
 #define NPY_VISIT_FIELD(name) Py_VISIT(state->n_ops.name);
     NPY_N_OPS_FIELDS(NPY_VISIT_FIELD)
 #undef NPY_VISIT_FIELD
 
+    for (int i = 0; i < NPY_NTYPES_LEGACY; i++) {
+        Py_VISIT(state->builtin_descrs[i]);
+    }
+    for (int i = 0; i < state->num_user_types; i++) {
+        Py_VISIT(state->user_descrs[i]);
+    }
+
     return 0;
 }
 
-static int
-multiarray_umath_clear(PyObject *m)
-{
-    multiarray_umath_state *state = get_module_state(m);
 
-#define NPY_CLEAR_FIELD(name) Py_CLEAR(state->interned_str.name);
-    NPY_INTERNED_STR_FIELDS(NPY_CLEAR_FIELD)
-#undef NPY_CLEAR_FIELD
-    for (int i = 0; i < NPY_ERRMODE_STRING_COUNT; i++) {
-        Py_CLEAR(state->interned_str.errmode_strings[i]);
-    }
+
+static int
+native_state_clear_payload(multiarray_umath_state *state)
+{
+    clear_user_types(state);
 
 #define NPY_CLEAR_FIELD(name) Py_CLEAR(state->static_pydata.name);
     NPY_STATIC_PYDATA_FIELDS(NPY_CLEAR_FIELD)
@@ -5113,16 +5158,282 @@ multiarray_umath_clear(PyObject *m)
     NPY_N_OPS_FIELDS(NPY_CLEAR_FIELD)
 #undef NPY_CLEAR_FIELD
 
+    for (int i = 0; i < NPY_NTYPES_LEGACY; i++) {
+        Py_CLEAR(state->builtin_descrs[i]);
+    }
+
+    return 0;
+}
+
+
+
+static int
+native_state_owner_traverse(npy_native_state_owner *self, visitproc visit, void *arg)
+{
+    Py_VISIT(Py_TYPE(self));
+    return native_state_traverse(&self->state, visit, arg);
+}
+
+static int
+native_state_owner_clear(npy_native_state_owner *self)
+{
+    /* Drop caches that may own arrays/context handles, but retain native type
+     * identities and cleanup names until the last native dependent has died.
+     * TypeClear can break type->ht_module cycles without invalidating C slots. */
+    return native_state_clear_payload(&self->state);
+}
+
+static void
+native_state_owner_dealloc(npy_native_state_owner *self)
+{
+    PyTypeObject *type = Py_TYPE(self);
+    multiarray_umath_state *state = &self->state;
+    PyObject_GC_UnTrack(self);
+    native_state_clear_payload(state);
+#define NPY_CLEAR_FIELD(name) Py_CLEAR(state->name);
+    NPY_MODULE_STATE_TYPE_FIELDS(NPY_CLEAR_FIELD)
+#undef NPY_CLEAR_FIELD
+#define NPY_CLEAR_FIELD(name) Py_CLEAR(state->interned_str.name);
+    NPY_INTERNED_STR_FIELDS(NPY_CLEAR_FIELD)
+#undef NPY_CLEAR_FIELD
+    for (int i = 0; i < NPY_ERRMODE_STRING_COUNT; i++) {
+        Py_CLEAR(state->interned_str.errmode_strings[i]);
+    }
+
+
+    PyMem_Free(state->array_api);
+    PyMem_Free(state->ufunc_api);
+#if PY_VERSION_HEX >= 0x030d0000
+    npy_module_state_unregister(state);
+#endif
+    type->tp_free((PyObject *)self);
+    Py_DECREF(type);
+}
+
+static PyType_Slot native_state_owner_slots[] = {
+    {Py_tp_dealloc, native_state_owner_dealloc},
+    {Py_tp_traverse, native_state_owner_traverse},
+    {Py_tp_clear, native_state_owner_clear},
+    {Py_tp_free, PyObject_GC_Del},
+    {0, NULL},
+};
+
+static PyType_Spec native_state_owner_spec = {
+    .name = "numpy._core._NativeStateOwner",
+    .basicsize = sizeof(npy_native_state_owner),
+    .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC | Py_TPFLAGS_IMMUTABLETYPE,
+    .slots = native_state_owner_slots,
+};
+
+static int
+initialize_child_state_owner(PyObject *module)
+{
+    if (PyInterpreterState_Get() == PyInterpreterState_Main()) {
+        return 0;
+    }
+    multiarray_umath_state *slot = PyModule_GetState(module);
+    PyTypeObject *type = (PyTypeObject *)PyType_FromSpec(&native_state_owner_spec);
+    if (type == NULL) {
+        return -1;
+    }
+    npy_native_state_owner *owner = (npy_native_state_owner *)type->tp_alloc(type, 0);
+    Py_DECREF(type);
+    if (owner == NULL) {
+        return -1;
+    }
+    /* Payload owner is borrowed from this object's own address. Only the
+     * module slot and actual dependents own Python references to it. */
+    owner->interpreter_id = PyInterpreterState_GetID(PyInterpreterState_Get());
+    if (owner->interpreter_id < 0) {
+        Py_DECREF(owner);
+        return -1;
+    }
+    owner->state.lifetime_owner = (PyObject *)owner;
+    slot->indirect_state = &owner->state;
+    slot->lifetime_owner = (PyObject *)owner;
+    return 0;
+}
+
+static int
+multiarray_umath_traverse(PyObject *module, visitproc visit, void *arg)
+{
+    multiarray_umath_state *slot = PyModule_GetState(module);
+    if (slot != NULL) {
+        Py_VISIT(slot->lifetime_owner);
+    }
+    return 0;
+}
+
+static int
+multiarray_umath_clear(PyObject *module)
+{
+    multiarray_umath_state *slot = PyModule_GetState(module);
+    if (slot != NULL && slot->lifetime_owner != NULL) {
+        PyObject *owner = slot->lifetime_owner;
+        slot->lifetime_owner = NULL;
+        slot->indirect_state = NULL;
+        Py_DECREF(owner);
+    }
     return 0;
 }
 
 static void
-multiarray_umath_free(void *m)
+multiarray_umath_free(void *module)
 {
-    multiarray_umath_clear((PyObject *)m);
-    _npy_module_state = NULL;
-}
+    multiarray_umath_state *slot = PyModule_GetState((PyObject *)module);
+    if (slot == NULL) {
+        return;
+    }
+    if (slot->lifetime_owner != NULL) {
+        multiarray_umath_clear((PyObject *)module);
+        return;
+    }
+    /* Original main/failure path; child payloads are released by their owner. */
+    clear_user_types(slot);
+    free_bool_scalar_pool((PyObject *)module);
+    PyMem_Free(slot->array_api);
+    PyMem_Free(slot->ufunc_api);
+#if PY_VERSION_HEX >= 0x030d0000
+    npy_module_state_unregister(slot);
 #endif
+}
+
+
+/* A capsule owns no Python reference and contains no interpreter pointer.
+ * Its immutable vtable acquires an explicit owner from the actual module. */
+static struct PyModuleDef moduledef;
+
+static multiarray_umath_state *
+npy_si_state_from_owner(PyObject *owner)
+{
+    if (PyModule_Check(owner) && PyModule_GetDef(owner) == &moduledef) {
+        if (PyInterpreterState_Get() != PyInterpreterState_Main()) {
+            PyErr_SetString(PyExc_RuntimeError, "NumPy main context used in another interpreter");
+            return NULL;
+        }
+        return get_module_state(owner);
+    }
+    if (Py_TYPE(owner)->tp_dealloc != (destructor)native_state_owner_dealloc) {
+        PyErr_SetString(PyExc_TypeError, "expected a NumPy native interpreter context");
+        return NULL;
+    }
+    npy_native_state_owner *context = (npy_native_state_owner *)owner;
+    int64_t current_id = PyInterpreterState_GetID(PyInterpreterState_Get());
+    if (current_id < 0) {
+        return NULL;
+    }
+    if (context->interpreter_id != current_id) {
+        PyErr_SetString(PyExc_RuntimeError, "NumPy context belongs to another interpreter");
+        return NULL;
+    }
+    return &context->state;
+}
+
+static PyObject *
+npy_si_get_owner(PyObject *module)
+{
+    if (!PyModule_Check(module) || PyModule_GetDef(module) != &moduledef) {
+        PyErr_SetString(PyExc_TypeError, "expected the native NumPy module");
+        return NULL;
+    }
+    multiarray_umath_state *slot = PyModule_GetState(module);
+    PyObject *owner = slot->lifetime_owner;
+    if (owner == NULL) {
+        if (PyInterpreterState_Get() != PyInterpreterState_Main()) {
+            PyErr_SetString(PyExc_RuntimeError, "NumPy child context is unavailable");
+            return NULL;
+        }
+        owner = module;
+    }
+    if (npy_si_state_from_owner(owner) == NULL) {
+        return NULL;
+    }
+    return Py_NewRef(owner);
+}
+
+static int
+npy_si_check_owner(PyObject *owner)
+{
+    multiarray_umath_state *state = npy_si_state_from_owner(owner);
+    if (state == NULL) {
+        return -1;
+    }
+    if (state->array_api == NULL || state->ufunc_api == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "NumPy native API tables are unavailable");
+        return -1;
+    }
+    return 0;
+}
+
+static void **
+npy_si_get_array_api(PyObject *owner)
+{
+    if (npy_si_check_owner(owner) < 0) {
+        return NULL;
+    }
+    return npy_si_state_from_owner(owner)->array_api;
+}
+
+static void **
+npy_si_get_ufunc_api(PyObject *owner)
+{
+    if (npy_si_check_owner(owner) < 0) {
+        return NULL;
+    }
+    return npy_si_state_from_owner(owner)->ufunc_api;
+}
+
+static PyObject *
+npy_si_get_bool(PyObject *owner, int value)
+{
+    if (npy_si_check_owner(owner) < 0) {
+        return NULL;
+    }
+    multiarray_umath_state *state = npy_si_state_from_owner(owner);
+    PyObject *result;
+    if (state->lifetime_owner == NULL) {
+        PyBoolScalarObject *values = (PyBoolScalarObject *)state->array_api[9];
+        result = (PyObject *)&values[value != 0];
+    }
+    else {
+        result = value ? state->bool_true : state->bool_false;
+    }
+    if (result == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "NumPy native Bool values were cleared");
+    }
+    return result;
+}
+
+static PyTypeObject *
+npy_si_get_scalar_type(PyObject *owner, int type_num)
+{
+    multiarray_umath_state *state = npy_si_state_from_owner(owner);
+    if (state == NULL) {
+        return NULL;
+    }
+    if (type_num < 0 || type_num >= NPY_NTYPES_LEGACY) {
+        PyErr_SetString(PyExc_ValueError, "expected a legacy NumPy scalar type number");
+        return NULL;
+    }
+    _PyArray_LegacyDescr *descr = state->builtin_descrs[type_num];
+    if (descr == NULL || descr->typeobj == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "NumPy native scalar type was cleared");
+        return NULL;
+    }
+    return descr->typeobj;
+}
+
+static const NPY_SI_ContextAPI npy_si_context_api = {
+    .abi_version = NPY_SI_CONTEXT_ABI_VERSION,
+    .struct_size = sizeof(NPY_SI_ContextAPI),
+    .get_owner = npy_si_get_owner,
+    .check_owner = npy_si_check_owner,
+    .get_array_api = npy_si_get_array_api,
+    .get_ufunc_api = npy_si_get_ufunc_api,
+    .get_bool = npy_si_get_bool,
+    .get_scalar_type = npy_si_get_scalar_type,
+};
+
 
 static int
 _multiarray_umath_exec_impl(PyObject *m, multiarray_umath_state *state) {
@@ -5158,8 +5469,31 @@ _multiarray_umath_exec_impl(PyObject *m, multiarray_umath_state *state) {
     if (!d) {
         return -1;
     }
+    s = PyList_New(0);
+    if (s == NULL) {
+        return -1;
+    }
+    int publication_result = PyDict_SetItemString(d, "_dtype_publications", s);
+    Py_DECREF(s);
+    if (publication_result < 0) {
+        return -1;
+    }
 
     if (intern_strings() < 0) {
+        return -1;
+    }
+
+    if (init_abstract_scalar_types(m) < 0 || init_void_scalar_type(m) < 0
+            || init_character_scalar_types(m) < 0 || init_temporal_scalar_types(m) < 0
+            || init_numeric_scalar_types(m) < 0 || init_object_scalar_type(m) < 0
+            || init_bool_scalar_type(m) < 0 || init_array_type(m) < 0) {
+        return -1;
+    }
+
+    if (init_dtype_meta_type(m) < 0 || init_descr_type(m) < 0) {
+        return -1;
+    }
+    if (init_builtin_legacy_descrs() < 0) {
         return -1;
     }
 
@@ -5179,38 +5513,12 @@ _multiarray_umath_exec_impl(PyObject *m, multiarray_umath_state *state) {
         return -1;
     }
 
-    /* Set __signature__ to None on the type (the instance has a property) */
-    s = npy_import("numpy._globals", "_signature_descriptor");
-    if (s == NULL) {
-        return -1;
-    }
-    PyUFunc_Type.tp_dict = Py_BuildValue(
-        "{ON}", state->interned_str.__signature__, s);
-    if (PyUFunc_Type.tp_dict == NULL) {
-        return -1;
-    }
-    if (PyType_Ready(&PyUFunc_Type) < 0) {
-        Py_CLEAR(PyUFunc_Type.tp_dict);
-        return -1;
-    }
-
-    PyArrayDTypeMeta_Type.tp_base = &PyType_Type;
-    if (PyType_Ready(&PyArrayDTypeMeta_Type) < 0) {
-        return -1;
-    }
-
-    PyArrayDescr_Type.tp_hash = PyArray_DescrHash;
-    Py_SET_TYPE(&PyArrayDescr_Type, &PyArrayDTypeMeta_Type);
-    if (PyType_Ready(&PyArrayDescr_Type) < 0) {
+    if (init_ufunc_type(m) < 0) {
         return -1;
     }
 
     initialize_casting_tables();
     initialize_numeric_types();
-
-    if (initscalarmath(m) < 0) {
-        return -1;
-    }
 
     if (PyType_Ready(&PyArray_Type) < 0) {
         return -1;
@@ -5219,31 +5527,23 @@ _multiarray_umath_exec_impl(PyObject *m, multiarray_umath_state *state) {
         return -1;
     }
 
-    PyArrayIter_Type.tp_iter = PyObject_SelfIter;
-    NpyIter_Type.tp_iter = PyObject_SelfIter;
-    PyArrayMultiIter_Type.tp_iter = PyObject_SelfIter;
-    if (PyType_Ready(&PyArrayIter_Type) < 0) {
+    if (init_legacy_iterator_types(m) < 0) {
         return -1;
     }
-    if (PyType_Ready(&PyArrayMapIter_Type) < 0) {
+    if (init_mapiter_type(m) < 0) {
         return -1;
     }
-    if (PyType_Ready(&PyArrayMultiIter_Type) < 0) {
+    if (init_neighborhood_iter_type(m) < 0) {
         return -1;
     }
-    PyArrayNeighborhoodIter_Type.tp_new = PyType_GenericNew;
-    if (PyType_Ready(&PyArrayNeighborhoodIter_Type) < 0) {
-        return -1;
-    }
-    if (PyType_Ready(&NpyIter_Type) < 0) {
+    if (init_nditer_type(m) < 0) {
         return -1;
     }
 
-    if (PyType_Ready(&PyArrayFlags_Type) < 0) {
+    if (init_arrayflags_type(m) < 0) {
         return -1;
     }
-    NpyBusDayCalendar_Type.tp_new = PyType_GenericNew;
-    if (PyType_Ready(&NpyBusDayCalendar_Type) < 0) {
+    if (init_busdaycalendar_type(m) < 0) {
         return -1;
     }
 
@@ -5332,22 +5632,23 @@ _multiarray_umath_exec_impl(PyObject *m, multiarray_umath_state *state) {
     PyDict_SetItemString(d, "broadcast",
                          (PyObject *)&PyArrayMultiIter_Type);
     PyDict_SetItemString(d, "dtype", (PyObject *)&PyArrayDescr_Type);
-    PyDict_SetItemString(d, "flagsobj", (PyObject *)&PyArrayFlags_Type);
+    PyDict_SetItemString(d, "flagsobj", (PyObject *)state->PyArrayFlags_Type);
 
     /* Business day calendar object */
     PyDict_SetItemString(d, "busdaycalendar",
-                            (PyObject *)&NpyBusDayCalendar_Type);
+                            (PyObject *)state->NpyBusDayCalendar_Type);
     set_flaginfo(d);
 
-    if (PyType_Ready(&PyArrayMethod_Type) < 0) {
-        return -1;
-    }
-    if (PyType_Ready(&PyBoundArrayMethod_Type) < 0) {
+    if (init_arraymethod_types(m) < 0) {
         return -1;
     }
 
-    /* Create all abstract DType classes */
-    if (initialize_abstract_dtypes() < 0) {
+    /*
+     * Create the abstract DType classes and expose them on ``numpy.dtypes``.
+     * Must run before ``set_typeinfo`` so the legacy concrete DType classes
+     * can use them as ``tp_base`` directly.
+     */
+    if (initialize_abstract_dtypes(m) < 0) {
         return -1;
     }
 
@@ -5374,25 +5675,25 @@ _multiarray_umath_exec_impl(PyObject *m, multiarray_umath_state *state) {
         return -1;
     }
 
-    if (PyType_Ready(&PyArrayFunctionDispatcher_Type) < 0) {
+    if (init_array_function_dispatcher_type(m) < 0) {
         return -1;
     }
     PyDict_SetItemString(
             d, "_ArrayFunctionDispatcher",
-            (PyObject *)&PyArrayFunctionDispatcher_Type);
+            (PyObject *)state->PyArrayFunctionDispatcher_Type);
 
-    if (PyType_Ready(&PyArrayArrayConverter_Type) < 0) {
+    if (init_array_converter_type(m) < 0) {
         return -1;
     }
     PyDict_SetItemString(
             d, "_array_converter",
-            (PyObject *)&PyArrayArrayConverter_Type);
+            (PyObject *)state->PyArrayArrayConverter_Type);
 
     if (PyArray_InitializeCasts() < 0) {
         return -1;
     }
 
-    if (init_string_dtype() < 0) {
+    if (init_string_dtype(m) < 0) {
         return -1;
     }
 
@@ -5405,7 +5706,8 @@ _multiarray_umath_exec_impl(PyObject *m, multiarray_umath_state *state) {
         return -1;
     }
 #ifdef Py_GIL_DISABLED
-    if (PyUnstable_SetImmortal(PyDataMem_DefaultHandler) == 0) {
+    if (PyInterpreterState_Get() == PyInterpreterState_Main()
+            && PyUnstable_SetImmortal(PyDataMem_DefaultHandler) == 0) {
         PyErr_SetString(PyExc_RuntimeError,
                         "Could not mark memory handler capsule as immortal");
         return -1;
@@ -5456,28 +5758,10 @@ _multiarray_umath_exec_impl(PyObject *m, multiarray_umath_state *state) {
         return -1;
     }
 
-    /*
-     * Initialize np.dtypes.StringDType
-     *
-     * Note that this happens here after initializing
-     * the legacy built-in DTypes to avoid a circular dependency
-     * during NumPy setup, since this needs to happen after
-     * init_string_dtype() but that needs to happen after
-     * the legacy dtypemeta classes are available.
-     */
-
-    if (npy_cache_import_runtime(
-            "numpy.dtypes", "_add_dtype_helper",
-            &state->runtime_imports._add_dtype_helper) == -1) {
+    if (PyDict_SetItemString(d, "StringDType", (PyObject *)&PyArray_StringDType) < 0
+            || npy_add_dtype_publication(m, (PyObject *)&PyArray_StringDType, NULL) < 0) {
         return -1;
     }
-
-    if (PyObject_CallFunction(
-            state->runtime_imports._add_dtype_helper,
-            "Os", (PyObject *)&PyArray_StringDType, NULL) == NULL) {
-        return -1;
-    }
-    PyDict_SetItemString(d, "StringDType", (PyObject *)&PyArray_StringDType);
 
     // initialize static reference to a zero-like array
     state->static_pydata.zero_pyint_like_arr = PyArray_ZEROS(
@@ -5492,24 +5776,65 @@ _multiarray_umath_exec_impl(PyObject *m, multiarray_umath_state *state) {
         return -1;
     }
 
+    s = PyList_AsTuple(PyDict_GetItemString(d, "_dtype_publications"));
+    if (s == NULL) {
+        return -1;
+    }
+    publication_result = PyDict_SetItemString(d, "_dtype_publications", s);
+    Py_DECREF(s);
+    if (publication_result < 0) {
+        return -1;
+    }
+
     /*
      * Export the API tables
      */
-    c_api = PyCapsule_New((void *)PyArray_API, NULL, NULL);
-    /* The dtype API is not auto-filled/generated via Python scripts: */
-    _fill_dtype_api(PyArray_API);
-    if (c_api == NULL) {
+    state->array_api = _create_array_api();
+    if (state->array_api == NULL) {
         return -1;
     }
-    PyDict_SetItemString(d, "_ARRAY_API", c_api);
-    Py_DECREF(c_api);
+    int legacy_api_supported =
+            PyInterpreterState_Get() == PyInterpreterState_Main();
+    if (PyDict_SetItemString(d, "_supports_legacy_c_api",
+            legacy_api_supported ? Py_True : Py_False) < 0) {
+        return -1;
+    }
+    if (legacy_api_supported) {
+        c_api = PyCapsule_New((void *)state->array_api, NULL, NULL);
+        if (c_api == NULL) {
+            return -1;
+        }
+        int api_result = PyDict_SetItemString(d, "_ARRAY_API", c_api);
+        Py_DECREF(c_api);
+        if (api_result < 0) {
+            return -1;
+        }
+    }
 
-    c_api = PyCapsule_New((void *)PyUFunc_API, NULL, NULL);
+    state->ufunc_api = _create_ufunc_api();
+    if (state->ufunc_api == NULL) {
+        return -1;
+    }
+    if (legacy_api_supported) {
+        c_api = PyCapsule_New((void *)state->ufunc_api, NULL, NULL);
+        if (c_api == NULL) {
+            return -1;
+        }
+        int api_result = PyDict_SetItemString(d, "_UFUNC_API", c_api);
+        Py_DECREF(c_api);
+        if (api_result < 0) {
+            return -1;
+        }
+    }
+    c_api = PyCapsule_New((void *)&npy_si_context_api, NPY_SI_CONTEXT_CAPSULE, NULL);
     if (c_api == NULL) {
         return -1;
     }
-    PyDict_SetItemString(d, "_UFUNC_API", c_api);
+    int context_result = PyDict_SetItemString(d, "_SI_CONTEXT_API_v1", c_api);
     Py_DECREF(c_api);
+    if (context_result < 0) {
+        return -1;
+    }
     if (PyErr_Occurred()) {
         return -1;
     }
@@ -5519,25 +5844,51 @@ _multiarray_umath_exec_impl(PyObject *m, multiarray_umath_state *state) {
 
 static int
 _multiarray_umath_exec(PyObject *m) {
+    if (initialize_child_state_owner(m) < 0) {
+        return -1;
+    }
+    multiarray_umath_state *state = get_module_state(m);
+#if PY_VERSION_HEX >= 0x030d0000
+    if (npy_module_state_register(state) < 0) {
+        return -1;
+    }
+#else
     if (module_loaded) {
         PyErr_SetString(PyExc_ImportError,
                         "cannot load module more than once per process");
         return -1;
     }
     module_loaded = 1;
-
-    /*
-     * Deallocating the module also frees the module state, so leak a
-     * reference to keep it valid for the life of the process.
-     */
-    Py_INCREF(m);
-
-    multiarray_umath_state *state = get_module_state(m);
     _npy_module_state = state;
+#endif
+    state->default_assign_casting = NPY_SAME_KIND_CASTING;
+
+    if (initialize_static_python_imports() < 0) {
+        /* No native types have been initialized or published yet. */
+#if PY_VERSION_HEX >= 0x030d0000
+        npy_module_state_unregister(state);
+#else
+        module_loaded = 0;
+        _npy_module_state = NULL;
+#endif
+        return -1;
+    }
+
+    /* Existing main static classes/C clients retain their process lifetime.
+     * Child native dependents own a GC-visible state context instead. */
+    int pin_main = PyInterpreterState_Get() == PyInterpreterState_Main();
+    if (pin_main) {
+        Py_INCREF(m);
+    }
 
     if (_multiarray_umath_exec_impl(m, state) < 0) {
+        clear_bool_scalar_values(m);
+#if PY_VERSION_HEX < 0x030d0000
         _npy_module_state = NULL;
-        Py_DECREF(m);
+#endif
+        if (pin_main) {
+            Py_DECREF(m);
+        }
         return -1;
     }
 
@@ -5546,7 +5897,9 @@ _multiarray_umath_exec(PyObject *m) {
 
 static struct PyModuleDef_Slot _multiarray_umath_slots[] = {
     {Py_mod_exec, _multiarray_umath_exec},
-#if PY_VERSION_HEX >= 0x030c00f0  // Python 3.12+
+#if PY_VERSION_HEX >= 0x030f0000
+    {Py_mod_multiple_interpreters, Py_MOD_PER_INTERPRETER_GIL_SUPPORTED},
+#elif PY_VERSION_HEX >= 0x030c00f0  // Python 3.12+
     {Py_mod_multiple_interpreters, Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED},
 #endif
 #if PY_VERSION_HEX >= 0x030d00f0  // Python 3.13+

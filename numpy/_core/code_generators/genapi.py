@@ -328,13 +328,15 @@ def write_file(filename, data):
 
 # Those *Api classes instances know how to output strings for the generated code
 class TypeApi:
-    def __init__(self, name, index, ptr_cast, api_name, internal_type=None):
+    def __init__(self, name, index, ptr_cast, api_name, internal_type=None,
+                 internal_getter=None):
         self.index = index
         self.name = name
         self.ptr_cast = ptr_cast
         self.api_name = api_name
         # The type used internally, if None, same as exported (ptr_cast)
         self.internal_type = internal_type
+        self.internal_getter = internal_getter
 
     def define_from_array_api_string(self):
         return (f"#define {self.name} (*({self.ptr_cast} *)"
@@ -344,6 +346,11 @@ class TypeApi:
         return f"        (void *) &{self.name}"
 
     def internal_define(self):
+        if self.internal_getter is not None:
+            return (
+                f"NPY_NO_EXPORT {self.ptr_cast} *{self.internal_getter}(void);\n"
+                f"#define {self.name} (*{self.internal_getter}())\n"
+            )
         if self.internal_type is None:
             return f"extern NPY_NO_EXPORT {self.ptr_cast} {self.name};\n"
 
@@ -360,11 +367,12 @@ class TypeApi:
         return astr
 
 class GlobalVarApi:
-    def __init__(self, name, index, type, api_name):
+    def __init__(self, name, index, type, api_name, internal_getter=None):
         self.name = name
         self.index = index
         self.type = type
         self.api_name = api_name
+        self.internal_getter = internal_getter
 
     def define_from_array_api_string(self):
         return f"#define {self.name} (*({self.type} *){self.api_name}[{self.index}])"
@@ -373,6 +381,11 @@ class GlobalVarApi:
         return f"        ({self.type} *) &{self.name}"
 
     def internal_define(self):
+        if self.internal_getter is not None:
+            return (
+                f"NPY_NO_EXPORT {self.type} *{self.internal_getter}(void);\n"
+                f"#define {self.name} (*{self.internal_getter}())\n"
+            )
         astr = f"""extern NPY_NO_EXPORT {self.type} {self.name};
 """
         return astr
@@ -390,13 +403,13 @@ class BoolValuesApi:
         return f"#define {self.name} (({self.type} *){self.api_name}[{self.index}])"
 
     def array_api_define(self):
-        return f"        (void *) &{self.name}"
+        return "        NULL"
 
     def internal_define(self):
-        astr = """\
-extern NPY_NO_EXPORT PyBoolScalarObject _PyArrayScalar_BoolValues[2];
+        return """\
+NPY_NO_EXPORT PyBoolScalarObject *_npy_get_bool_scalar_values(void);
+#define _PyArrayScalar_BoolValues (_npy_get_bool_scalar_values())
 """
-        return astr
 
 class FunctionApi:
     def __init__(self, name, index, annotations, return_type, args, api_name):

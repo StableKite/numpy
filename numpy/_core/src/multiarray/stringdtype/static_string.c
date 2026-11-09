@@ -354,7 +354,10 @@ NpyString_acquire_allocators(size_t n_descriptors,
                              npy_string_allocator *allocators[])
 {
     for (size_t i = 0; i < n_descriptors; i++) {
-        if (NPY_DTYPE(descrs[i]) != &PyArray_StringDType) {
+        /* String loops may run with their Python thread state detached.
+         * The built-in type number identifies their retained descriptors
+         * without consulting the interpreter's type registry. */
+        if (descrs[i]->type_num != NPY_VSTRING) {
             allocators[i] = NULL;
             continue;
         }

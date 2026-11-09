@@ -8,6 +8,9 @@ extern "C" {
 #endif
 
 NPY_NO_EXPORT int
+initialize_static_python_imports(void);
+
+NPY_NO_EXPORT int
 initialize_static_globals(void);
 
 NPY_NO_EXPORT int

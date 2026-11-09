@@ -9,6 +9,9 @@
 extern "C" {
 #endif
 
+NPY_NO_EXPORT int
+init_array_type(PyObject *module);
+
 NPY_NO_EXPORT PyObject *
 _strings_richcompare(PyArrayObject *self, PyArrayObject *other, int cmp_op,
                      int rstrip);

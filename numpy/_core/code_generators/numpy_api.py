@@ -47,8 +47,7 @@ multiarray_scalar_bool_values = {
 multiarray_types_api = {
     # Slot 1 was never meaningfully used by NumPy
     'PyArray_Type':                     (2,),
-    # Internally, PyArrayDescr_Type is a PyArray_DTypeMeta,
-    # the following also defines PyArrayDescr_TypeFull (Full appended)
+    # Internally, PyArrayDescr_Type is a module-owned PyArray_DTypeMeta.
     'PyArrayDescr_Type':                (3, "PyArray_DTypeMeta"),
     # Unused slot 4, was `PyArrayFlags_Type`
     'PyArrayIter_Type':                 (5,),

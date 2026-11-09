@@ -10,6 +10,9 @@ extern "C" {
 NPY_NO_EXPORT int
 set_typeinfo(PyObject *dict);
 
+NPY_NO_EXPORT int
+init_builtin_legacy_descrs(void);
+
 /* needed for blasfuncs, matmul, and vecdot */
 /**begin repeat
  *

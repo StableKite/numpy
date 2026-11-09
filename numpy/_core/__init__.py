@@ -104,6 +104,17 @@ if not (hasattr(multiarray, '_multiarray_umath') and
         "numpy until none is found, then reinstall this version.")
     raise ImportError(msg.format(path))
 
+# Publish DTypes after the native module has completed initialization.
+# A failed Python import can retry publication using the same native types.
+import numpy as _numpy
+from numpy import dtypes as _dtypes
+
+# A retry creates a new parent package while the dtype module stays cached.
+_numpy.dtypes = _dtypes
+for _dtype, _alias in multiarray._multiarray_umath._dtype_publications:
+    _dtypes._add_dtype_helper(_dtype, _alias)
+del _dtype, _alias, _dtypes, _numpy
+
 from . import numerictypes as nt
 from .numerictypes import sctypeDict, sctypes
 
@@ -179,7 +190,7 @@ def _DType_reconstruct(scalar_type):
 
 def _DType_reduce(DType):
     # As types/classes, most DTypes can simply be pickled by their name:
-    if not DType._legacy or DType.__module__ == "numpy.dtypes":
+    if DType is dtype or not DType._legacy or DType.__module__ == "numpy.dtypes":
         return DType.__name__
 
     # However, user defined legacy dtypes (like rational) do not end up in

@@ -1501,6 +1501,98 @@ fail:
 }
 
 
+/* Static C method/member/getset definitions are shared by the extension's
+ * interpreter instances. They need process-lifetime C text, not an untracked
+ * Python string reference. Intern identical text so repeated imports do not
+ * allocate another copy. Heap type tp_doc is separately owned by CPython. */
+typedef struct npy_native_doc_text {
+    struct npy_native_doc_text *next;
+    char *text;
+} npy_native_doc_text;
+
+static npy_native_doc_text *npy_native_doc_texts = NULL;
+#if PY_VERSION_HEX >= 0x030d0000
+static PyMutex npy_native_doc_mutex = {0};
+#define NPY_DOC_LOCK() PyMutex_Lock(&npy_native_doc_mutex)
+#define NPY_DOC_UNLOCK() PyMutex_Unlock(&npy_native_doc_mutex)
+#else
+#define NPY_DOC_LOCK() ((void)0)
+#define NPY_DOC_UNLOCK() ((void)0)
+#endif
+
+static int
+npy_install_docstring(const char **target, const char *text,
+                      const char *name, int heap_type_owned)
+{
+    int mismatch;
+    NPY_DOC_LOCK();
+    if (*target != NULL) {
+        mismatch = strcmp(*target, text) != 0;
+        NPY_DOC_UNLOCK();
+        if (mismatch) {
+            PyErr_Format(PyExc_RuntimeError,
+                    "%s method already has a different docstring", name);
+            return -1;
+        }
+        return 0;
+    }
+    NPY_DOC_UNLOCK();
+
+    size_t size = strlen(text) + 1;
+    char *heap_copy = NULL;
+    npy_native_doc_text *candidate = NULL;
+    if (heap_type_owned) {
+        heap_copy = PyMem_Malloc(size);
+        if (heap_copy == NULL) {
+            PyErr_NoMemory();
+            return -1;
+        }
+        memcpy(heap_copy, text, size);
+    }
+    else {
+        candidate = PyMem_RawMalloc(sizeof(*candidate) + size);
+        if (candidate == NULL) {
+            PyErr_NoMemory();
+            return -1;
+        }
+        candidate->text = (char *)(candidate + 1);
+        memcpy(candidate->text, text, size);
+    }
+
+    /* Only C memory operations occur while the native mutex is held. */
+    NPY_DOC_LOCK();
+    mismatch = 0;
+    if (*target != NULL) {
+        mismatch = strcmp(*target, text) != 0;
+    }
+    else if (heap_type_owned) {
+        *target = heap_copy;
+        heap_copy = NULL;  /* PyType_Type.tp_dealloc calls PyMem_Free. */
+    }
+    else {
+        npy_native_doc_text *entry = npy_native_doc_texts;
+        while (entry != NULL && strcmp(entry->text, text) != 0) {
+            entry = entry->next;
+        }
+        if (entry == NULL) {
+            candidate->next = npy_native_doc_texts;
+            npy_native_doc_texts = candidate;
+            entry = candidate;
+            candidate = NULL;
+        }
+        *target = entry->text;
+    }
+    NPY_DOC_UNLOCK();
+    PyMem_Free(heap_copy);
+    PyMem_RawFree(candidate);
+    if (mismatch) {
+        PyErr_Format(PyExc_RuntimeError,
+                "%s method already has a different docstring", name);
+        return -1;
+    }
+    return 0;
+}
+
 /* Can only be called if doc is currently NULL */
 NPY_NO_EXPORT PyObject *
 arr_add_docstring(PyObject *module, PyObject *const *args, Py_ssize_t len_args)
@@ -1541,15 +1633,11 @@ arr_add_docstring(PyObject *module, PyObject *const *args, Py_ssize_t len_args)
         return NULL;
     }
 
-#define _ADDDOC(doc, name)                                              \
-        if (!(doc)) {                                                   \
-            doc = docstr;                                               \
-            Py_INCREF(str);  /* hold on to string (leaks reference) */  \
-        }                                                               \
-        else if (strcmp(doc, docstr) != 0) {                            \
-            PyErr_Format(PyExc_RuntimeError, "%s method %s", name, msg); \
-            return NULL;                                                \
-        }
+#define _ADDDOC(doc, name) do { \
+        if (npy_install_docstring(&(doc), docstr, name, 0) < 0) { \
+            return NULL; \
+        } \
+    } while (0)
 
     if (Py_TYPE(obj) == &PyCFunction_Type) {
         PyCFunctionObject *new = (PyCFunctionObject *)obj;
@@ -1557,21 +1645,29 @@ arr_add_docstring(PyObject *module, PyObject *const *args, Py_ssize_t len_args)
     }
     else if (PyObject_TypeCheck(obj, &PyType_Type)) {
         /*
-         * We add it to both `tp_doc` and `__doc__` here.  Note that in theory
-         * `tp_doc` extracts the signature line, but we currently do not use
-         * it.  It may make sense to only add it as `__doc__` and
-         * `__text_signature__` to the dict in the future.
-         * The dictionary path is only necessary for heaptypes (currently not
-         * used) and metaclasses.
+         * tp_doc retains the signature prefix; a heap type's __doc__ in its
+         * dictionary contains only the body, just as for a static type.
          * If `__doc__` as stored in `tp_dict` is None, we assume this was
          * filled in by `PyType_Ready()` and should also be replaced.
          */
         PyTypeObject *new = (PyTypeObject *)obj;
-        _ADDDOC(new->tp_doc, new->tp_name);
+        if (npy_install_docstring(&new->tp_doc, docstr, new->tp_name,
+                (new->tp_flags & Py_TPFLAGS_HEAPTYPE) != 0) < 0) {
+            return NULL;
+        }
         if (new->tp_dict != NULL && PyDict_CheckExact(new->tp_dict) &&
                 PyDict_GetItemString(new->tp_dict, "__doc__") == Py_None) { // noqa: borrowed-ref - manual fix needed
+            static const char signature_end[] = "\n--\n\n";
+            const char *after_signature = strstr(docstr, signature_end);
+            PyObject *body = after_signature == NULL ? Py_NewRef(str) :
+                    PyUnicode_FromString(after_signature + strlen(signature_end));
+            if (body == NULL) {
+                return NULL;
+            }
             /* Warning: Modifying `tp_dict` is not generally safe! */
-            if (PyDict_SetItemString(new->tp_dict, "__doc__", str) < 0) {
+            int result = PyDict_SetItemString(new->tp_dict, "__doc__", body);
+            Py_DECREF(body);
+            if (result < 0) {
                 return NULL;
             }
         }
@@ -1970,9 +2066,10 @@ unpack_bits(PyObject *input, int axis, PyObject *count_obj, char order)
     in_stride = PyArray_STRIDE(new, axis);
     out_stride = PyArray_STRIDE(out, axis);
 
-    NPY_BEGIN_THREADS_THRESHOLDED(PyArray_Size((PyObject *)out) / 8);
-
+    /* Resolve interpreter state while attached; the loop uses only C data. */
     npy_static_cdata_struct *cdata = &_npy_module_state->static_cdata;
+
+    NPY_BEGIN_THREADS_THRESHOLDED(PyArray_Size((PyObject *)out) / 8);
 
     while (PyArray_ITER_NOTDONE(it)) {
         npy_intp index;

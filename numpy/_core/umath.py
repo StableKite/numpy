@@ -11,12 +11,20 @@ import numpy
 from . import _multiarray_umath
 from ._multiarray_umath import *
 
+if _multiarray_umath._supports_legacy_c_api:
+    _UFUNC_API = _multiarray_umath._UFUNC_API
+
+
+def __getattr__(name):
+    if name == '_UFUNC_API':
+        return getattr(_multiarray_umath, name)
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
 # These imports are needed for backward compatibility,
 # do not change them. issue gh-11862
 # _ones_like is semi-public, on purpose not added to __all__
 # These imports are needed for the strip & replace implementations
 from ._multiarray_umath import (
-    _UFUNC_API,
     _center,
     _expandtabs,
     _expandtabs_length,

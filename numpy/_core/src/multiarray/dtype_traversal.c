@@ -641,3 +641,366 @@ npy_get_zerofill_void_and_legacy_user_dtype_loop(
     *out_func = NULL;
     return 0;
 }
+
+
+/* Immutable native reference layout. No node retains a Python object. */
+enum npy_object_ref_kind {
+    NPY_OBJECT_REF_NONE,
+    NPY_OBJECT_REF_OBJECT,
+    NPY_OBJECT_REF_GROUP,
+    NPY_OBJECT_REF_REPEAT,
+};
+
+typedef struct {
+    enum npy_object_ref_kind kind;
+    npy_intp offset;
+    npy_intp nrefs;
+    npy_intp first_child;
+    npy_intp next_sibling;
+    npy_intp count;
+    npy_intp stride;
+} npy_object_ref_node;
+
+typedef struct {
+    npy_intp child;
+    npy_intp upper;
+} npy_object_ref_edge;
+
+struct npy_object_reference_plan {
+    npy_object_ref_node *nodes;
+    npy_object_ref_edge *edges;
+    npy_intp length;
+    npy_intp capacity;
+};
+
+typedef struct {
+    PyArray_Descr *descr;  /* Borrowed only while the builder runs. */
+    npy_intp node;
+    npy_intp index;
+    npy_intp count;
+    npy_intp last_child;
+    int initialized;
+} npy_object_ref_build_frame;
+
+NPY_NO_EXPORT void
+npy_object_reference_plan_free(npy_object_reference_plan *plan)
+{
+    if (plan != NULL) {
+        PyMem_RawFree(plan->nodes);
+        PyMem_RawFree(plan->edges);
+        PyMem_RawFree(plan);
+    }
+}
+
+static int
+object_ref_plan_append(npy_object_reference_plan *plan, npy_intp offset,
+                       npy_intp *index)
+{
+    if (plan->length == plan->capacity) {
+        if (plan->capacity > NPY_MAX_INTP / (2 * (npy_intp)sizeof(*plan->nodes))) {
+            PyErr_NoMemory();
+            return -1;
+        }
+        npy_intp capacity = plan->capacity == 0 ? 16 : 2 * plan->capacity;
+        npy_object_ref_node *nodes = PyMem_RawRealloc(
+                plan->nodes, capacity * sizeof(*nodes));
+        if (nodes == NULL) {
+            PyErr_NoMemory();
+            return -1;
+        }
+        plan->nodes = nodes;
+        plan->capacity = capacity;
+    }
+    *index = plan->length++;
+    plan->nodes[*index] = (npy_object_ref_node){
+        .offset = offset, .first_child = -1, .next_sibling = -1,
+    };
+    return 0;
+}
+
+NPY_NO_EXPORT int
+npy_object_reference_plan_new(PyArray_Descr *descr,
+                              npy_object_reference_plan **result)
+{
+    *result = NULL;
+    if (!PyDataType_ISLEGACY(descr) || !PyDataType_REFCHK(descr)) {
+        return 0;
+    }
+    npy_object_reference_plan *plan = PyMem_RawCalloc(1, sizeof(*plan));
+    if (plan == NULL) {
+        PyErr_NoMemory();
+        return -1;
+    }
+    npy_object_ref_build_frame local[16];
+    npy_object_ref_build_frame *frames = local;
+    npy_intp capacity = Py_ARRAY_LENGTH(local), depth = 1;
+    npy_intp root;
+    if (object_ref_plan_append(plan, 0, &root) < 0) {
+        goto fail;
+    }
+    frames[0] = (npy_object_ref_build_frame){
+        .descr = descr, .node = root, .last_child = -1,
+    };
+    while (depth > 0) {
+        npy_object_ref_build_frame *frame = &frames[depth - 1];
+        npy_object_ref_node *node = &plan->nodes[frame->node];
+        if (!frame->initialized) {
+            frame->initialized = 1;
+            if (frame->descr->type_num == NPY_OBJECT) {
+                if (frame->descr->elsize < (npy_intp)sizeof(PyObject *)) {
+                    PyErr_SetString(PyExc_ValueError, "invalid object reference size");
+                    goto fail;
+                }
+                node->kind = NPY_OBJECT_REF_OBJECT;
+                node->nrefs = 1;
+            }
+            else if (PyDataType_ISLEGACY(frame->descr)
+                    && PyDataType_REFCHK(frame->descr)) {
+                _PyArray_LegacyDescr *legacy = (_PyArray_LegacyDescr *)frame->descr;
+                if (legacy->subarray != NULL && legacy->subarray->base->elsize > 0) {
+                    npy_intp step = legacy->subarray->base->elsize;
+                    if (legacy->elsize < 0 || legacy->elsize % step != 0) {
+                        PyErr_SetString(PyExc_ValueError, "invalid object subarray layout");
+                        goto fail;
+                    }
+                    node->kind = NPY_OBJECT_REF_REPEAT;
+                    node->stride = step;
+                    node->count = legacy->elsize / step;
+                    frame->count = node->count == 0 ? 0 : 1;
+                }
+                else if (legacy->names != NULL) {
+                    node->kind = NPY_OBJECT_REF_GROUP;
+                    frame->count = PyTuple_GET_SIZE(legacy->names);
+                }
+            }
+        }
+        if (frame->index == frame->count) {
+            if (node->kind == NPY_OBJECT_REF_REPEAT && node->nrefs != 0) {
+                if (node->count > NPY_MAX_INTP / node->nrefs) {
+                    PyErr_SetString(PyExc_OverflowError, "object reference count overflow");
+                    goto fail;
+                }
+                node->nrefs *= node->count;
+            }
+            npy_intp count = node->nrefs;
+            depth--;
+            if (depth != 0) {
+                npy_object_ref_node *parent = &plan->nodes[frames[depth - 1].node];
+                if (parent->nrefs > NPY_MAX_INTP - count) {
+                    PyErr_SetString(PyExc_OverflowError, "object reference count overflow");
+                    goto fail;
+                }
+                parent->nrefs += count;
+            }
+            continue;
+        }
+        _PyArray_LegacyDescr *legacy = (_PyArray_LegacyDescr *)frame->descr;
+        PyArray_Descr *child_descr;
+        npy_intp offset = 0;
+        if (node->kind == NPY_OBJECT_REF_REPEAT) {
+            child_descr = legacy->subarray->base;
+        }
+        else {
+            PyObject *name = PyTuple_GET_ITEM(legacy->names, frame->index);
+            PyObject *field = legacy->fields == NULL ? NULL :
+                    PyDict_GetItemWithError(legacy->fields, name);
+            if (field == NULL || !PyTuple_Check(field) || PyTuple_GET_SIZE(field) < 2) {
+                if (!PyErr_Occurred()) {
+                    PyErr_SetString(PyExc_ValueError, "incomplete structured reference layout");
+                }
+                goto fail;
+            }
+            child_descr = (PyArray_Descr *)PyTuple_GET_ITEM(field, 0);
+            offset = PyLong_AsSsize_t(PyTuple_GET_ITEM(field, 1));
+            if (offset == -1 && PyErr_Occurred()) {
+                goto fail;
+            }
+            if (offset < 0 || child_descr->elsize < 0
+                    || offset > frame->descr->elsize
+                    || child_descr->elsize > frame->descr->elsize - offset) {
+                PyErr_SetString(PyExc_ValueError, "object field outside descriptor layout");
+                goto fail;
+            }
+        }
+        frame->index++;
+        if (!PyDataType_ISLEGACY(child_descr) || !PyDataType_REFCHK(child_descr)) {
+            continue;
+        }
+        for (npy_intp i = 0; i < depth; i++) {
+            if (frames[i].descr == child_descr) {
+                PyErr_SetString(PyExc_ValueError, "cyclic descriptor reference layout");
+                goto fail;
+            }
+        }
+        npy_intp child;
+        if (object_ref_plan_append(plan, offset, &child) < 0) {
+            goto fail;
+        }
+        /* Appending may move the node buffer. */
+        node = &plan->nodes[frame->node];
+        if (frame->last_child == -1) {
+            node->first_child = child;
+        }
+        else {
+            plan->nodes[frame->last_child].next_sibling = child;
+        }
+        frame->last_child = child;
+        if (depth == capacity) {
+            if (capacity > NPY_MAX_INTP / (2 * (npy_intp)sizeof(*frames))) {
+                PyErr_NoMemory();
+                goto fail;
+            }
+            npy_intp larger_capacity = 2 * capacity;
+            npy_object_ref_build_frame *larger = PyMem_RawMalloc(
+                    larger_capacity * sizeof(*larger));
+            if (larger == NULL) {
+                PyErr_NoMemory();
+                goto fail;
+            }
+            memcpy(larger, frames, depth * sizeof(*frames));
+            if (frames != local) {
+                PyMem_RawFree(frames);
+            }
+            frames = larger;
+            capacity = larger_capacity;
+        }
+        frames[depth++] = (npy_object_ref_build_frame){
+            .descr = child_descr, .node = child, .last_child = -1,
+        };
+    }
+    if (frames != local) {
+        PyMem_RawFree(frames);
+    }
+    if (plan->nodes[0].nrefs == 0) {
+        /* A valid empty legacy layout must not fall back to Python fields. */
+        *result = plan;
+    }
+    else {
+        if (plan->length > NPY_MAX_INTP / (npy_intp)sizeof(*plan->edges)) {
+            PyErr_NoMemory();
+            npy_object_reference_plan_free(plan);
+            return -1;
+        }
+        plan->edges = PyMem_RawMalloc(plan->length * sizeof(*plan->edges));
+        if (plan->edges == NULL) {
+            PyErr_NoMemory();
+            npy_object_reference_plan_free(plan);
+            return -1;
+        }
+        npy_intp edge_count = 0;
+        for (npy_intp i = 0; i < plan->length; i++) {
+            npy_object_ref_node *node = &plan->nodes[i];
+            if (node->kind != NPY_OBJECT_REF_GROUP) {
+                continue;
+            }
+            /* Dense ordinal indexes avoid a quadratic scan for wide records. */
+            node->stride = edge_count;
+            node->count = 0;
+            npy_intp upper = 0;
+            for (npy_intp child = node->first_child; child != -1;
+                    child = plan->nodes[child].next_sibling) {
+                upper += plan->nodes[child].nrefs;
+                plan->edges[edge_count++] = (npy_object_ref_edge){child, upper};
+                node->count++;
+            }
+        }
+        *result = plan;
+    }
+    return 0;
+fail:
+    if (frames != local) {
+        PyMem_RawFree(frames);
+    }
+    npy_object_reference_plan_free(plan);
+    return -1;
+}
+
+/* Descend using subtree counts instead of a mutable execution stack. */
+static npy_intp
+object_ref_plan_offset(const npy_object_reference_plan *plan, npy_intp ordinal)
+{
+    const npy_object_ref_node *node = &plan->nodes[0];
+    npy_intp offset = 0;
+    for (;;) {
+        offset += node->offset;
+        if (node->kind == NPY_OBJECT_REF_OBJECT) {
+            return offset;
+        }
+        const npy_object_ref_node *child = &plan->nodes[node->first_child];
+        if (node->kind == NPY_OBJECT_REF_REPEAT) {
+            offset += (ordinal / child->nrefs) * node->stride;
+            ordinal %= child->nrefs;
+        }
+        else {
+            const npy_object_ref_edge *edges = plan->edges + node->stride;
+            npy_intp low = 0, high = node->count;
+            while (low < high) {
+                npy_intp middle = low + (high - low) / 2;
+                if (ordinal >= edges[middle].upper) {
+                    low = middle + 1;
+                }
+                else {
+                    high = middle;
+                }
+            }
+            if (low > 0) {
+                ordinal -= edges[low - 1].upper;
+            }
+            child = &plan->nodes[edges[low].child];
+        }
+        node = child;
+    }
+}
+
+NPY_NO_EXPORT int
+npy_object_reference_plan_apply_item(const npy_object_reference_plan *plan,
+                                     char *data, visitproc visit, void *arg)
+{
+    npy_intp nrefs = plan->nodes[0].nrefs;
+    for (npy_intp j = 0; j < nrefs; j++) {
+        char *address = data + object_ref_plan_offset(plan, j);
+        PyObject *object;
+        memcpy(&object, address, sizeof(object));
+        if (visit == NULL) {
+            /* A destructor may reenter: relinquish ownership first. */
+            memset(address, 0, sizeof(object));
+            Py_XDECREF(object);
+        }
+        else if (object != NULL) {
+            int result = visit(object, arg);
+            if (result != 0) {
+                return result;
+            }
+        }
+    }
+    return 0;
+}
+
+NPY_NO_EXPORT int
+npy_object_reference_plan_apply(const npy_object_reference_plan *plan,
+                                PyArrayObject *array, visitproc visit, void *arg)
+{
+    npy_intp nrefs = plan->nodes[0].nrefs;
+    if (nrefs == 0) {
+        return 0;
+    }
+    npy_intp coordinates[NPY_MAXDIMS] = {0};
+    char *data = PyArray_BYTES(array);
+    npy_intp size = PyArray_SIZE(array);
+    for (npy_intp i = 0; i < size; i++) {
+        int result = npy_object_reference_plan_apply_item(plan, data, visit, arg);
+        if (result != 0) {
+            return result;
+        }
+        for (int axis = PyArray_NDIM(array) - 1; axis >= 0; axis--) {
+            coordinates[axis]++;
+            data += PyArray_STRIDES(array)[axis];
+            if (coordinates[axis] < PyArray_DIMS(array)[axis]) {
+                break;
+            }
+            data -= coordinates[axis] * PyArray_STRIDES(array)[axis];
+            coordinates[axis] = 0;
+        }
+    }
+    return 0;
+}

@@ -1595,6 +1595,7 @@ def make_ufuncs(funcdict):
                 PyArray_DTypeMeta *dtype = PyArray_DTypeFromTypeNum({typenum});
                 PyObject *info = get_info_no_cast((PyUFuncObject *)f,
                                                    dtype, {count});
+                Py_DECREF(dtype);
                 if (info == NULL) {{
                     return -1;
                 }}

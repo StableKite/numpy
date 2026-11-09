@@ -9,6 +9,7 @@
 #include "numpy/arrayscalars.h"
 
 #include "arrayobject.h"
+#include "npy_buffer.h"
 #include "arrayfunction_override.h"
 #include "npy_argparse.h"
 #include "npy_config.h"
@@ -2154,6 +2155,14 @@ array_setstate(PyArrayObject *self, PyObject *args)
     fa->flags = NPY_ARRAY_DEFAULT;
 
     fa->nd = nd;
+
+    if (_buffer_info_init_native_owner((PyObject *)self, &fa->_buffer_info) < 0) {
+        goto end;
+    }
+    if (PyObject_IS_GC((PyObject *)self)
+            && _buffer_info_init_object_plan(self, typecode) < 0) {
+        goto end;
+    }
 
     if (nd > 0) {
         fa->dimensions = npy_alloc_cache_dim(2 * nd);

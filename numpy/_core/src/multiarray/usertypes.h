@@ -3,7 +3,9 @@
 
 #include "array_method.h"
 
-extern NPY_NO_EXPORT _PyArray_LegacyDescr **userdescrs;
+NPY_NO_EXPORT _PyArray_LegacyDescr ***
+_npy_get_userdescrs(void);
+#define userdescrs (*_npy_get_userdescrs())
 
 NPY_NO_EXPORT _PyArray_LegacyDescr *
 _PyArray_LegacyDescrNewFromPrototype(

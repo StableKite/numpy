@@ -2273,7 +2273,174 @@ _npy_import_entry_point(PyObject *NPY_UNUSED(self), PyObject *obj) {
     return res;
 }
 
+/* Exercise the loaded core's real DTypeMeta slots, without registering
+ * or publishing the temporary abstract DType. */
+static PyObject *
+dtype_meta_clear_cycle(PyObject *module, PyObject *NPY_UNUSED(unused))
+{
+    PyType_Slot slots[] = {{0, NULL}};
+    PyType_Spec spec = {
+        .name = "numpy._core._multiarray_tests.EphemeralDType",
+        .basicsize = (int)PyArrayDescr_Type.tp_basicsize,
+        .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_DISALLOW_INSTANTIATION,
+        .slots = slots,
+    };
+    PyObject *bases = PyTuple_Pack(1, (PyObject *)&PyArrayDescr_Type);
+    if (bases == NULL) {
+        return NULL;
+    }
+    PyTypeObject *meta = Py_TYPE(&PyArrayDescr_Type);
+    PyArray_DTypeMeta *type = (PyArray_DTypeMeta *)PyType_FromMetaclass(
+            meta, module, &spec, bases);
+    Py_DECREF(bases);
+    if (type == NULL) {
+        return NULL;
+    }
+    type->scalar_type = (PyTypeObject *)Py_NewRef(type);
+    int result = meta->tp_clear == NULL ? 0 : meta->tp_clear((PyObject *)type);
+    int cleared = type->scalar_type == NULL;
+    Py_CLEAR(type->scalar_type);
+    Py_DECREF(type);
+    if (result < 0) {
+        return NULL;
+    }
+    return PyBool_FromLong(cleared);
+}
+
+
+typedef struct {
+    NpyAuxData base;
+    int original_error;
+    int *counts;
+} DescrCloneFaultAux;
+
+
+static void
+descr_clone_fault_free(NpyAuxData *data)
+{
+    ((DescrCloneFaultAux *)data)->counts[1]++;
+    PyMem_Free(data);
+}
+
+static NpyAuxData *
+descr_clone_fault_clone(NpyAuxData *data)
+{
+    ((DescrCloneFaultAux *)data)->counts[0]++;
+    if (((DescrCloneFaultAux *)data)->original_error) {
+        PyErr_SetString(PyExc_ValueError, "original auxiliary clone failure");
+    }
+    return NULL;
+}
+
+static PyObject *
+descr_clone_failure(PyObject *module, PyObject *argument)
+{
+    int original_error = PyObject_IsTrue(argument);
+    if (original_error < 0) {
+        return NULL;
+    }
+    int counts[2] = {0, 0};
+    PyArray_Descr *builtin = PyArray_DescrFromType(NPY_VOID);
+    if (builtin == NULL) {
+        return NULL;
+    }
+    _PyArray_LegacyDescr *base = (_PyArray_LegacyDescr *)PyArray_DescrNew(builtin);
+    Py_DECREF(builtin);
+    if (base == NULL) {
+        return NULL;
+    }
+    PyObject *metadata = PyDict_New();
+    if (metadata == NULL) {
+        Py_DECREF(base);
+        return NULL;
+    }
+    DescrCloneFaultAux *aux = PyMem_Calloc(1, sizeof(*aux));
+    if (aux == NULL) {
+        Py_DECREF(metadata);
+        Py_DECREF(base);
+        return PyErr_NoMemory();
+    }
+    aux->base.free = descr_clone_fault_free;
+    aux->base.clone = descr_clone_fault_clone;
+    aux->original_error = original_error;
+    aux->counts = counts;
+    base->c_metadata = &aux->base;
+    Py_XSETREF(base->metadata, Py_NewRef(metadata));
+    PyType_Slot scalar_slots[] = {{0, NULL}};
+    PyType_Spec scalar_spec = {
+        .name = "numpy._core._multiarray_tests.CloneScalar",
+        .basicsize = sizeof(PyObject),
+        .flags = Py_TPFLAGS_DEFAULT,
+        .slots = scalar_slots,
+    };
+    PyObject *scalar_guard = PyType_FromSpec(&scalar_spec);
+    if (scalar_guard == NULL) {
+        Py_DECREF(metadata);
+        Py_DECREF(base);
+        return NULL;
+    }
+    Py_XSETREF(base->typeobj, (PyTypeObject *)Py_NewRef(scalar_guard));
+    Py_ssize_t before_metadata = Py_REFCNT(metadata);
+    Py_ssize_t before_scalar = Py_REFCNT(scalar_guard);
+    PyArray_Descr *copy = PyArray_DescrNew((PyArray_Descr *)base);
+    PyObject *error_type = NULL, *error_value = NULL, *error_traceback = NULL;
+    PyErr_Fetch(&error_type, &error_value, &error_traceback);
+    Py_ssize_t lost_metadata = before_metadata - Py_REFCNT(metadata);
+    Py_ssize_t lost_scalar = before_scalar - Py_REFCNT(scalar_guard);
+    /* The baseline incorrectly drops the source's owned refs. Guard refs
+     * keep the objects alive; restore precisely those refs before cleanup. */
+    if (lost_metadata < 0 || lost_metadata > 1 || lost_scalar < 0 || lost_scalar > 1) {
+        Py_FatalError("unexpected reference delta in isolated clone fixture");
+    }
+    if (lost_metadata) {
+        Py_INCREF(metadata);
+    }
+    if (lost_scalar) {
+        Py_INCREF(scalar_guard);
+    }
+    int memory_error = error_type != NULL && PyErr_GivenExceptionMatches(error_type, PyExc_MemoryError);
+    int value_error = error_type != NULL && PyErr_GivenExceptionMatches(error_type, PyExc_ValueError);
+    int failed = copy == NULL;
+    Py_XDECREF(copy);
+    Py_XDECREF(error_type);
+    Py_XDECREF(error_value);
+    Py_XDECREF(error_traceback);
+    Py_DECREF(base);
+    Py_DECREF(metadata);
+    Py_DECREF(scalar_guard);
+    return Py_BuildValue("(nniiiii)", lost_metadata, lost_scalar, failed,
+                         memory_error, value_error, counts[0], counts[1]);
+}
+
+
+static PyObject *
+create_heap_array_gc_type(PyObject *module, PyObject *NPY_UNUSED(unused))
+{
+    PyType_Slot slots[] = {
+        {Py_tp_traverse, PyArray_Type.tp_traverse},
+        {Py_tp_clear, PyArray_Type.tp_clear},
+        {0, NULL},
+    };
+    PyType_Spec spec = {
+        .name = "numpy._core._multiarray_tests.HeapGCArray",
+        .basicsize = (int)PyArray_Type.tp_basicsize,
+        .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC,
+        .slots = slots,
+    };
+    PyObject *bases = PyTuple_Pack(1, (PyObject *)&PyArray_Type);
+    if (bases == NULL) {
+        return NULL;
+    }
+    PyObject *type = PyType_FromModuleAndSpec(module, &spec, bases);
+    Py_DECREF(bases);
+    return type;
+}
+
+
 static PyMethodDef Multiarray_TestsMethods[] = {
+    {"create_heap_array_gc_type", create_heap_array_gc_type, METH_NOARGS, NULL},
+    {"descr_clone_failure", descr_clone_failure, METH_O, NULL},
+    {"dtype_meta_clear_cycle", dtype_meta_clear_cycle, METH_NOARGS, NULL},
     {"argparse_example_function",
          (PyCFunction)argparse_example_function,
          METH_KEYWORDS | METH_FASTCALL, NULL},

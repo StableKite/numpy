@@ -4,6 +4,7 @@
 #include "numpy/ndarraytypes.h"
 #include "arrayobject.h"
 #include "dtypemeta.h"
+#include "module_state.h"
 
 
 #ifdef __cplusplus
@@ -17,22 +18,16 @@ extern "C" {
  * Since types are historically not defined as references we define
  * dereferenced macro versions below for `&Type` style use.
  */
-NPY_NO_EXPORT extern PyArray_DTypeMeta *PyArray_IntAbstractDTypePtr;
-NPY_NO_EXPORT extern PyArray_DTypeMeta *PyArray_FloatAbstractDTypePtr;
-NPY_NO_EXPORT extern PyArray_DTypeMeta *PyArray_ComplexAbstractDTypePtr;
-NPY_NO_EXPORT extern PyArray_DTypeMeta *PyArray_PyLongDTypePtr;
-NPY_NO_EXPORT extern PyArray_DTypeMeta *PyArray_PyFloatDTypePtr;
-NPY_NO_EXPORT extern PyArray_DTypeMeta *PyArray_PyComplexDTypePtr;
 
-#define PyArray_IntAbstractDType (*PyArray_IntAbstractDTypePtr)
-#define PyArray_FloatAbstractDType (*PyArray_FloatAbstractDTypePtr)
-#define PyArray_ComplexAbstractDType (*PyArray_ComplexAbstractDTypePtr)
-#define PyArray_PyLongDType (*PyArray_PyLongDTypePtr)
-#define PyArray_PyFloatDType (*PyArray_PyFloatDTypePtr)
-#define PyArray_PyComplexDType (*PyArray_PyComplexDTypePtr)
+#define PyArray_IntAbstractDType (*(PyArray_DTypeMeta *)_npy_module_state->integer_abstract_dtype)
+#define PyArray_FloatAbstractDType (*(PyArray_DTypeMeta *)_npy_module_state->float_abstract_dtype)
+#define PyArray_ComplexAbstractDType (*(PyArray_DTypeMeta *)_npy_module_state->complex_abstract_dtype)
+#define PyArray_PyLongDType (*(PyArray_DTypeMeta *)_npy_module_state->pylong_dtype)
+#define PyArray_PyFloatDType (*(PyArray_DTypeMeta *)_npy_module_state->pyfloat_dtype)
+#define PyArray_PyComplexDType (*(PyArray_DTypeMeta *)_npy_module_state->pycomplex_dtype)
 
 NPY_NO_EXPORT int
-initialize_abstract_dtypes(void);
+initialize_abstract_dtypes(PyObject *module);
 
 
 /*

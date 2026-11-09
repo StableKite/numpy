@@ -85,8 +85,21 @@ typedef struct {
 } PyBoundArrayMethodObject;
 
 
-extern NPY_NO_EXPORT PyTypeObject PyArrayMethod_Type;
-extern NPY_NO_EXPORT PyTypeObject PyBoundArrayMethod_Type;
+NPY_NO_EXPORT PyTypeObject *
+_npy_get_arraymethod_type(void);
+NPY_NO_EXPORT PyTypeObject *
+_npy_get_boundarraymethod_type(void);
+#define PyArrayMethod_Type (*_npy_get_arraymethod_type())
+#define PyBoundArrayMethod_Type (*_npy_get_boundarraymethod_type())
+
+NPY_NO_EXPORT int
+init_arraymethod_types(PyObject *module);
+
+NPY_NO_EXPORT PyArrayMethodObject *
+npy_arraymethod_new(void);
+
+NPY_NO_EXPORT PyBoundArrayMethodObject *
+npy_boundarraymethod_new(void);
 
 
 /*

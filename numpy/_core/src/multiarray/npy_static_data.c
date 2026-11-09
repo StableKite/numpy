@@ -84,36 +84,11 @@ intern_strings(void)
     }
 
 
-/*
- * Initializes global constants.
- *
- * All global constants should live inside the npy_static_pydata
- * struct.
- *
- * Not all entries in the struct are initialized here, some are
- * initialized later but care must be taken in those cases to initialize
- * the constant in a thread-safe manner, ensuring it is initialized
- * exactly once.
- *
- * Anything initialized here is initialized during module import which
- * the python interpreter ensures is done in a single thread.
- *
- * Anything imported here should not need the C-layer at all and will be
- * imported before anything on the C-side is initialized.
- */
-NPY_NO_EXPORT int
-initialize_static_globals(void)
+/* These imports do not depend on the native core being initialized. */
+static int
+import_static_python_data(multiarray_umath_state *state)
 {
-    multiarray_umath_state *state = _npy_module_state;
-    /*
-     * Initialize contents of npy_static_pydata struct
-     *
-     * This struct holds cached references to python objects
-     * that we want to keep alive for the lifetime of the
-     * module for performance reasons
-     */
     npy_static_pydata_struct *static_pydata = &state->static_pydata;
-
     IMPORT_GLOBAL("math", "floor",
                   static_pydata->math_floor_func);
 
@@ -170,6 +145,37 @@ initialize_static_globals(void)
 
     IMPORT_GLOBAL("os", "PathLike",
                   static_pydata->os_PathLike);
+
+
+    IMPORT_GLOBAL("numpy.dtypes", "_add_dtype_helper",
+                  state->runtime_imports._add_dtype_helper);
+
+    return 0;
+}
+
+NPY_NO_EXPORT int
+initialize_static_python_imports(void)
+{
+    multiarray_umath_state *state = _npy_module_state;
+    if (import_static_python_data(state) == 0) {
+        return 0;
+    }
+
+    PyObject *error = PyErr_GetRaisedException();
+#define NPY_CLEAR_STATIC_FIELD(name) Py_CLEAR(state->static_pydata.name);
+    NPY_STATIC_PYDATA_FIELDS(NPY_CLEAR_STATIC_FIELD)
+#undef NPY_CLEAR_STATIC_FIELD
+    Py_CLEAR(state->runtime_imports._add_dtype_helper);
+    PyErr_SetRaisedException(error);
+    return -1;
+}
+
+/* Initialize native constants after their types are available. */
+NPY_NO_EXPORT int
+initialize_static_globals(void)
+{
+    multiarray_umath_state *state = _npy_module_state;
+    npy_static_pydata_struct *static_pydata = &state->static_pydata;
 
     // default_truediv_type_tup
     PyArray_Descr *tmp = PyArray_DescrFromType(NPY_DOUBLE);

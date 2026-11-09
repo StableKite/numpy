@@ -373,10 +373,11 @@ add_dtype_loops(PyObject *umath, PyArrayMethod_Spec *spec, PyObject *info)
     /*
      * Install the promoter info to allow two Python integers to work.
      */
-    return PyUFunc_AddLoop((PyUFuncObject *)ufunc, info, 0);
-
-    Py_DECREF(ufunc);
-    return 0;
+    {
+        int res = PyUFunc_AddLoop((PyUFuncObject *)ufunc, info, 0);
+        Py_DECREF(ufunc);
+        return res;
+    }
 
   fail:
     Py_DECREF(ufunc);

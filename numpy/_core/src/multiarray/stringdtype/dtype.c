@@ -220,7 +220,10 @@ stringdtype_common_na_coerce(int ndescrs, PyArray_Descr *const descrs[],
     PyObject *na_object = NULL;
     int coerce = 1;
     for (int i = 0; i < ndescrs; i++) {
-        if (NPY_DTYPE(descrs[i]) != &PyArray_StringDType) {
+        /* String loops may run with their Python thread state detached.
+         * The built-in type number identifies their retained descriptors
+         * without consulting the interpreter's type registry. */
+        if (descrs[i]->type_num != NPY_VSTRING) {
             continue;
         }
         PyArray_StringDTypeObject *descr = (PyArray_StringDTypeObject *)descrs[i];
@@ -249,7 +252,10 @@ stringdtype_effective_na_descr(int ndescrs, PyArray_Descr *const descrs[])
 {
     PyArray_StringDTypeObject *first = NULL;
     for (int i = 0; i < ndescrs; i++) {
-        if (NPY_DTYPE(descrs[i]) != &PyArray_StringDType) {
+        /* String loops may run with their Python thread state detached.
+         * The built-in type number identifies their retained descriptors
+         * without consulting the interpreter's type registry. */
+        if (descrs[i]->type_num != NPY_VSTRING) {
             continue;
         }
         PyArray_StringDTypeObject *descr = (PyArray_StringDTypeObject *)descrs[i];
@@ -861,17 +867,48 @@ stringdtype_new(PyTypeObject *NPY_UNUSED(cls), PyObject *args, PyObject *kwds)
     return new_stringdtype_instance(na_object, coerce);
 }
 
+static int
+stringdtype_traverse(PyArray_StringDTypeObject *self, visitproc visit, void *arg)
+{
+    PyTypeObject *base = Py_TYPE(self)->tp_base;
+    if (!(base->tp_flags & Py_TPFLAGS_HEAPTYPE)) {
+        Py_VISIT(Py_TYPE(self));
+    }
+    Py_VISIT(self->na_object);
+    return base->tp_traverse((PyObject *)self, visit, arg);
+}
+
+static int
+stringdtype_clear(PyArray_StringDTypeObject *self)
+{
+    Py_CLEAR(self->na_object);
+    return Py_TYPE(self)->tp_base->tp_clear((PyObject *)self);
+}
+
 static void
 stringdtype_dealloc(PyArray_StringDTypeObject *self)
 {
-    Py_XDECREF(self->na_object);
+    PyTypeObject *type = Py_TYPE(self);
+    PyTypeObject *base = type->tp_base;
+    int base_is_heap = base->tp_flags & Py_TPFLAGS_HEAPTYPE;
+    if (PyObject_GC_IsTracked((PyObject *)self)) {
+        PyObject_GC_UnTrack(self);
+    }
+    Py_CLEAR(self->na_object);
     // this can be null if an error happens while initializing an instance
     if (self->allocator != NULL) {
         NpyString_free_allocator(self->allocator);
+        self->allocator = NULL;
     }
     PyMem_RawFree((char *)self->na_name.buf);
+    self->na_name.buf = NULL;
     PyMem_RawFree((char *)self->default_string.buf);
-    PyArrayDescr_Type.tp_dealloc((PyObject *)self);
+    self->default_string.buf = NULL;
+    base->tp_dealloc((PyObject *)self);
+    /* A static base leaves this heap subtype reference to its caller. */
+    if (!base_is_heap) {
+        Py_DECREF(type);
+    }
 }
 
 static PyObject *
@@ -1009,28 +1046,32 @@ PyArray_StringDType_hash(PyObject *self)
     return ret;
 }
 
-/*
- * This is the basic things that you need to create a Python Type/Class in C.
- * However, there is a slight difference here because we create a
- * PyArray_DTypeMeta, which is a larger struct than a typical type.
- * (This should get a bit nicer eventually with Python >3.11.)
- */
-PyArray_DTypeMeta PyArray_StringDType = {
-        {{
-                PyVarObject_HEAD_INIT(NULL, 0).tp_name =
-                        "numpy.dtypes.StringDType",
-                .tp_basicsize = sizeof(PyArray_StringDTypeObject),
-                .tp_new = stringdtype_new,
-                .tp_dealloc = (destructor)stringdtype_dealloc,
-                .tp_repr = (reprfunc)stringdtype_repr,
-                .tp_str = (reprfunc)stringdtype_repr,
-                .tp_methods = PyArray_StringDType_methods,
-                .tp_members = PyArray_StringDType_members,
-                .tp_richcompare = PyArray_StringDType_richcompare,
-                .tp_hash = PyArray_StringDType_hash,
-        }},
-        /* rest, filled in during DTypeMeta initialization */
+static PyType_Slot string_dtype_type_slots[] = {
+    {Py_tp_new, stringdtype_new},
+    {Py_tp_dealloc, stringdtype_dealloc},
+    {Py_tp_traverse, stringdtype_traverse},
+    {Py_tp_clear, stringdtype_clear},
+    {Py_tp_repr, stringdtype_repr},
+    {Py_tp_str, stringdtype_repr},
+    {Py_tp_methods, PyArray_StringDType_methods},
+    {Py_tp_members, PyArray_StringDType_members},
+    {Py_tp_richcompare, PyArray_StringDType_richcompare},
+    {Py_tp_hash, PyArray_StringDType_hash},
+    {0, NULL},
 };
+
+static PyType_Spec string_dtype_type_spec = {
+    .name = "numpy.dtypes.StringDType",
+    .basicsize = sizeof(PyArray_StringDTypeObject),
+    .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_IMMUTABLETYPE,
+    .slots = string_dtype_type_slots,
+};
+
+NPY_NO_EXPORT PyArray_DTypeMeta *
+_npy_get_string_dtype(void)
+{
+    return (PyArray_DTypeMeta *)_npy_module_state->string_dtype_type;
+}
 
 NPY_NO_EXPORT int
 init_stringdtype_sorts(void)
@@ -1089,9 +1130,29 @@ init_stringdtype_sorts(void)
 }
 
 NPY_NO_EXPORT int
-init_string_dtype(void)
+init_string_dtype(PyObject *module)
 {
+    PyObject *bases = PyTuple_Pack(1, (PyObject *)&PyArrayDescr_Type);
+    if (bases == NULL) {
+        return -1;
+    }
+    PyType_Spec spec = string_dtype_type_spec;
+    /* Explicit slots suppress automatic GC-flag inheritance in CPython. */
+    if (PyArrayDescr_Type.tp_flags & Py_TPFLAGS_HAVE_GC) {
+        spec.flags |= Py_TPFLAGS_HAVE_GC;
+    }
+    PyObject *type = PyType_FromMetaclass(
+            &PyArrayDTypeMeta_Type, module, &spec, bases);
+    Py_DECREF(bases);
+    if (type == NULL) {
+        return -1;
+    }
+    get_module_state(module)->string_dtype_type = (PyTypeObject *)type;
+
     PyArrayMethod_Spec **PyArray_StringDType_casts = get_casts();
+    if (PyArray_StringDType_casts == NULL) {
+        return -1;
+    }
 
     PyArrayDTypeMeta_Spec PyArray_StringDType_DTypeSpec = {
             .flags = NPY_DT_PARAMETRIC,
@@ -1099,13 +1160,6 @@ init_string_dtype(void)
             .slots = PyArray_StringDType_Slots,
             .casts = PyArray_StringDType_casts,
     };
-
-    /* Loaded dynamically, so needs to be set here: */
-    ((PyObject *)&PyArray_StringDType)->ob_type = &PyArrayDTypeMeta_Type;
-    ((PyTypeObject *)&PyArray_StringDType)->tp_base = &PyArrayDescr_Type;
-    if (PyType_Ready((PyTypeObject *)&PyArray_StringDType) < 0) {
-        return -1;
-    }
 
     if (dtypemeta_initialize_struct_from_spec(
                 &PyArray_StringDType, &PyArray_StringDType_DTypeSpec, 1) < 0) {

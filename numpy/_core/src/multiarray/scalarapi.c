@@ -18,6 +18,8 @@
 #include "descriptor.h"
 #include "dtypemeta.h"
 #include "scalartypes.h"
+#include "npy_buffer.h"
+#include "dtype_traversal.h"
 
 #include "common.h"
 #include "module_state.h"
@@ -457,6 +459,13 @@ PyArray_TypeObjectFromType(int type)
     return obj;
 }
 
+static int
+scalar_copy_incref_object(PyObject *object, void *NPY_UNUSED(arg))
+{
+    Py_INCREF(object);
+    return 0;
+}
+
 /* Does nothing with descr (cannot be NULL) */
 /*NUMPY_API
   Get scalar-equivalent to a region of memory described by a descriptor.
@@ -574,6 +583,12 @@ PyArray_Scalar(void *data, PyArray_Descr *descr, PyObject *base)
                     return obj;
                 }
             }
+            if (PyObject_IS_GC(obj) && PyDataType_REFCHK(descr)) {
+                if (_buffer_info_init_void_object_plan(obj, descr) < 0) {
+                    Py_DECREF(obj);
+                    return NULL;
+                }
+            }
             if (itemsize == 0) {
                 return obj;
             }
@@ -590,6 +605,13 @@ PyArray_Scalar(void *data, PyArray_Descr *descr, PyObject *base)
              */
             if (base == NULL) {
                 memcpy(destptr, data, itemsize);
+                const npy_object_reference_plan *plan =
+                        _buffer_info_get_object_plan(vobj->_buffer_info);
+                if (plan != NULL) {
+                    /* The owned copy must acquire each source reference. */
+                    npy_object_reference_plan_apply_item(
+                            plan, destptr, scalar_copy_incref_object, NULL);
+                }
                 return obj;
             }
         }

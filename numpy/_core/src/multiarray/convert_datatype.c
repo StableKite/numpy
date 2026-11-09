@@ -225,12 +225,13 @@ PyArray_GetBoundCastingImpl(PyArray_DTypeMeta *from, PyArray_DTypeMeta *to)
 
     /* TODO: Create better way to wrap method into bound method */
     PyBoundArrayMethodObject *res;
-    res = PyObject_New(PyBoundArrayMethodObject, &PyBoundArrayMethod_Type);
+    res = npy_boundarraymethod_new();
     if (res == NULL) {
+        Py_DECREF(method);
         return NULL;
     }
     res->method = (PyArrayMethodObject *)method;
-    res->dtypes = PyMem_Malloc(2 * sizeof(PyArray_DTypeMeta *));
+    res->dtypes = PyMem_Calloc(2, sizeof(PyArray_DTypeMeta *));
     if (res->dtypes == NULL) {
         Py_DECREF(res);
         PyErr_NoMemory();
@@ -2420,6 +2421,7 @@ PyArray_InitializeNumericCasts(void)
                 return -1;
             }
         }
+        Py_DECREF(from_dt);
     }
     return 0;
 }
@@ -3541,16 +3543,33 @@ PyArray_InitializeObjectToObjectCast(void)
     return res;
 }
 
+static PyArrayMethodObject *
+npy_general_cast_method_new(const char *name)
+{
+    PyArrayMethodObject *method = npy_arraymethod_new();
+    if (method == NULL) {
+        return NULL;
+    }
+    size_t size = strlen(name) + 1;
+    method->name = PyMem_Malloc(size);
+    if (method->name == NULL) {
+        Py_DECREF(method);
+        PyErr_NoMemory();
+        return NULL;
+    }
+    memcpy(method->name, name, size);
+    return method;
+}
+
 static int
 initialize_void_and_object_globals(void) {
     multiarray_umath_state *state = _npy_module_state;
-    PyArrayMethodObject *method = PyObject_New(PyArrayMethodObject, &PyArrayMethod_Type);
+    PyArrayMethodObject *method = npy_general_cast_method_new("void_to_any_cast");
     if (method == NULL) {
         PyErr_NoMemory();
         return -1;
     }
 
-    method->name = "void_to_any_cast";
     method->flags = NPY_METH_SUPPORTS_UNALIGNED | NPY_METH_REQUIRES_PYAPI;
     method->casting = -1;
     method->resolve_descriptors = &structured_to_nonstructured_resolve_descriptors;
@@ -3559,13 +3578,12 @@ initialize_void_and_object_globals(void) {
     method->nout = 1;
     state->static_pydata.VoidToGenericMethod = (PyObject *)method;
 
-    method = PyObject_New(PyArrayMethodObject, &PyArrayMethod_Type);
+    method = npy_general_cast_method_new("any_to_void_cast");
     if (method == NULL) {
         PyErr_NoMemory();
         return -1;
     }
 
-    method->name = "any_to_void_cast";
     method->flags = NPY_METH_SUPPORTS_UNALIGNED | NPY_METH_REQUIRES_PYAPI;
     method->casting = -1;
     method->resolve_descriptors = &nonstructured_to_structured_resolve_descriptors;
@@ -3574,7 +3592,7 @@ initialize_void_and_object_globals(void) {
     method->nout = 1;
     state->static_pydata.GenericToVoidMethod = (PyObject *)method;
 
-    method = PyObject_New(PyArrayMethodObject, &PyArrayMethod_Type);
+    method = npy_general_cast_method_new("object_to_any_cast");
     if (method == NULL) {
         PyErr_NoMemory();
         return -1;
@@ -3582,7 +3600,6 @@ initialize_void_and_object_globals(void) {
 
     method->nin = 1;
     method->nout = 1;
-    method->name = "object_to_any_cast";
     method->flags = (NPY_METH_SUPPORTS_UNALIGNED
                      | NPY_METH_REQUIRES_PYAPI
                      | NPY_METH_NO_FLOATINGPOINT_ERRORS);
@@ -3591,7 +3608,7 @@ initialize_void_and_object_globals(void) {
     method->get_strided_loop = &object_to_any_get_loop;
     state->static_pydata.ObjectToGenericMethod = (PyObject *)method;
 
-    method = PyObject_New(PyArrayMethodObject, &PyArrayMethod_Type);
+    method = npy_general_cast_method_new("any_to_object_cast");
     if (method == NULL) {
         PyErr_NoMemory();
         return -1;
@@ -3599,7 +3616,6 @@ initialize_void_and_object_globals(void) {
 
     method->nin = 1;
     method->nout = 1;
-    method->name = "any_to_object_cast";
     method->flags = (NPY_METH_SUPPORTS_UNALIGNED
                      | NPY_METH_REQUIRES_PYAPI
                      | NPY_METH_NO_FLOATINGPOINT_ERRORS);

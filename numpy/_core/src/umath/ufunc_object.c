@@ -5024,15 +5024,13 @@ PyUFunc_FromFuncAndDataAndSignatureAndIdentity(PyUFuncGenericFunction *func, voi
         return NULL;
     }
 
-    ufunc = PyObject_GC_New(PyUFuncObject, &PyUFunc_Type);
-    /*
-     * We use GC_New here for ufunc->obj, but do not use GC_Track since
-     * ufunc->obj is still NULL at the end of this function.
-     * See ufunc_frompyfunc where ufunc->obj is set and GC_Track is called.
-     */
+    PyTypeObject *type = &PyUFunc_Type;
+    ufunc = (PyUFuncObject *)type->tp_alloc(type, 0);
     if (ufunc == NULL) {
         return NULL;
     }
+    /* Track again once all the variable parts have been initialized. */
+    PyObject_GC_UnTrack(ufunc);
 
     ufunc->nin = nin;
     ufunc->nout = nout;
@@ -5155,6 +5153,8 @@ PyUFunc_FromFuncAndDataAndSignatureAndIdentity(PyUFuncGenericFunction *func, voi
      *       datetimes, this meant that `timedelta.sum(dtype="f8")` returned
      *       datetimes (and not floats or error), arguably wrong, but...
      */
+    /* All owned fields are initialized; expose their cycles to the GC. */
+    PyObject_GC_Track(ufunc);
     return (PyObject *)ufunc;
 }
 
@@ -5537,29 +5537,38 @@ _PyUFuncObject_GET_ITEM_DATA(const PyUFuncObject *obj)
     return (PyUFuncObject_fields *)((char *)obj + offsetof(PyUFuncObject_fields, nin));
 }
 
+static int
+ufunc_clear(PyUFuncObject *ufunc)
+{
+    /* The dispatch cache borrows from the owned loops and dtype references. */
+    if (ufunc->_dispatch_cache != NULL) {
+        PyArrayIdentityHash_Dealloc(ufunc->_dispatch_cache);
+        ufunc->_dispatch_cache = NULL;
+    }
+    Py_CLEAR(ufunc->userloops);
+    Py_CLEAR(ufunc->identity_value);
+    Py_CLEAR(ufunc->obj);
+    Py_CLEAR(ufunc->dict);
+    Py_CLEAR(ufunc->_loops);
+    return 0;
+}
+
 static void
 ufunc_dealloc(PyUFuncObject *ufunc)
 {
+    PyTypeObject *type = Py_TYPE(ufunc);
     PyObject_GC_UnTrack((PyObject *)ufunc);
-    PyArray_free(ufunc->core_num_dims);
-    PyArray_free(ufunc->core_dim_ixs);
-    PyArray_free(ufunc->core_dim_sizes);
-    PyArray_free(ufunc->core_dim_flags);
-    PyArray_free(ufunc->core_offsets);
-    PyArray_free(ufunc->core_signature);
-    PyArray_free(ufunc->ptr);
-    PyArray_free(ufunc->op_flags);
-    Py_XDECREF(ufunc->userloops);
-    if (ufunc->identity == PyUFunc_IdentityValue) {
-        Py_DECREF(ufunc->identity_value);
-    }
-    Py_XDECREF(ufunc->obj);
-    Py_XDECREF(ufunc->dict);
-    Py_XDECREF(ufunc->_loops);
-    if (ufunc->_dispatch_cache != NULL) {
-        PyArrayIdentityHash_Dealloc(ufunc->_dispatch_cache);
-    }
-    PyObject_GC_Del(ufunc);
+    PyMem_RawFree(ufunc->core_num_dims);
+    PyMem_RawFree(ufunc->core_dim_ixs);
+    PyMem_RawFree(ufunc->core_dim_sizes);
+    PyMem_RawFree(ufunc->core_dim_flags);
+    PyMem_RawFree(ufunc->core_offsets);
+    PyMem_RawFree(ufunc->core_signature);
+    PyMem_RawFree(ufunc->ptr);
+    PyMem_RawFree(ufunc->op_flags);
+    ufunc_clear(ufunc);
+    type->tp_free((PyObject *)ufunc);
+    Py_DECREF(type);
 }
 
 static PyObject *
@@ -5571,11 +5580,12 @@ ufunc_repr(PyUFuncObject *ufunc)
 static int
 ufunc_traverse(PyUFuncObject *self, visitproc visit, void *arg)
 {
+    Py_VISIT(Py_TYPE(self));
     Py_VISIT(self->obj);
-    if (self->identity == PyUFunc_IdentityValue) {
-        Py_VISIT(self->identity_value);
-    }
+    Py_VISIT(self->identity_value);
     Py_VISIT(self->dict);
+    Py_VISIT(self->userloops);
+    Py_VISIT(self->_loops);
     return 0;
 }
 
@@ -6953,35 +6963,82 @@ static PyGetSetDef ufunc_getset[] = {
 static PyMemberDef ufunc_members[] = {
     {"__dict__", T_OBJECT, offsetof(PyUFuncObject, dict),
      READONLY},
+    {"__dictoffset__", T_PYSSIZET, offsetof(PyUFuncObject, dict), READONLY},
+    {"__vectorcalloffset__", T_PYSSIZET,
+     offsetof(PyUFuncObject, vectorcall), READONLY},
     {NULL},
 };
+
+static PyObject *
+ufunc_getattro(PyObject *self, PyObject *name)
+{
+    if (PyUnicode_Check(name)
+            && PyUnicode_CompareWithASCIIString(name, "__module__") == 0) {
+        /*
+         * Heap types have a __module__ entry, while the old static ufunc
+         * type did not expose one on instances.  Preserve that distinction:
+         * pickle must discover the defining module of each individual ufunc.
+         */
+        PyObject *value = NULL;
+        PyObject *dict = ((PyUFuncObject *)self)->dict;
+        if (dict != NULL) {
+            int result = PyDict_GetItemRef(dict, name, &value);
+            if (result != 0) {
+                return value;
+            }
+        }
+        PyErr_SetString(PyExc_AttributeError,
+                "'numpy.ufunc' object has no attribute '__module__'");
+        return NULL;
+    }
+    return PyObject_GenericGetAttr(self, name);
+}
 
 
 /******************************************************************************
  ***                        UFUNC TYPE OBJECT                               ***
  *****************************************************************************/
 
-NPY_NO_EXPORT PyTypeObject PyUFunc_Type = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "numpy.ufunc",
-    .tp_basicsize = sizeof(PyUFuncObject),
-    .tp_dealloc = (destructor)ufunc_dealloc,
-    .tp_vectorcall_offset = offsetof(PyUFuncObject, vectorcall),
-    .tp_repr = (reprfunc)ufunc_repr,
-    .tp_call = &PyVectorcall_Call,
-    .tp_str = (reprfunc)ufunc_repr,
-    .tp_flags = Py_TPFLAGS_DEFAULT |
-        _Py_TPFLAGS_HAVE_VECTORCALL |
-        Py_TPFLAGS_HAVE_GC,
-    .tp_traverse = (traverseproc)ufunc_traverse,
-    .tp_methods = ufunc_methods,
-    .tp_getset = ufunc_getset,
-    .tp_getattro = PyObject_GenericGetAttr,
-    .tp_setattro = PyObject_GenericSetAttr,
-    // TODO when Python 3.12 is the minimum supported version,
-    // use Py_TPFLAGS_MANAGED_DICT
-    .tp_members = ufunc_members,
-    .tp_dictoffset = offsetof(PyUFuncObject, dict),
+static PyType_Slot ufunc_slots[] = {
+    {Py_tp_dealloc, ufunc_dealloc},
+    {Py_tp_repr, ufunc_repr},
+    {Py_tp_call, PyVectorcall_Call},
+    {Py_tp_str, ufunc_repr},
+    {Py_tp_traverse, ufunc_traverse},
+    {Py_tp_clear, ufunc_clear},
+    {Py_tp_methods, ufunc_methods},
+    {Py_tp_getset, ufunc_getset},
+    {Py_tp_getattro, ufunc_getattro},
+    {Py_tp_setattro, PyObject_GenericSetAttr},
+    {Py_tp_members, ufunc_members},
+    {0, NULL},
 };
+
+static PyType_Spec ufunc_spec = {
+    .name = "numpy.ufunc",
+    .basicsize = sizeof(PyUFuncObject),
+    .flags = (Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_VECTORCALL
+              | Py_TPFLAGS_HAVE_GC | Py_TPFLAGS_IMMUTABLETYPE
+              | Py_TPFLAGS_DISALLOW_INSTANTIATION),
+    .slots = ufunc_slots,
+};
+
+NPY_NO_EXPORT PyTypeObject *
+_npy_get_ufunc_type(void)
+{
+    return _npy_module_state->ufunc_type;
+}
+
+NPY_NO_EXPORT int
+init_ufunc_type(PyObject *module)
+{
+    multiarray_umath_state *state = get_module_state(module);
+    state->ufunc_type = (PyTypeObject *)PyType_FromModuleAndSpec(
+            module, &ufunc_spec, NULL);
+    if (state->ufunc_type == NULL) {
+        return -1;
+    }
+    return 0;
+}
 
 /* End of code for ufunc objects */

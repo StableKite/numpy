@@ -460,13 +460,14 @@ def _needs_add_docstring(obj):
 
     This function errs on the side of being overly conservative.
     """
-    Py_TPFLAGS_HEAPTYPE = 1 << 9
+    Py_TPFLAGS_IMMUTABLETYPE = 1 << 8
 
     if isinstance(obj, (types.FunctionType, types.MethodType, property)):
         return False
 
-    if isinstance(obj, type) and obj.__flags__ & Py_TPFLAGS_HEAPTYPE:
-        return False
+    if isinstance(obj, type):
+        # Native immutable heap types also require the C docstring setter.
+        return bool(obj.__flags__ & Py_TPFLAGS_IMMUTABLETYPE)
 
     return True
 
@@ -539,15 +540,12 @@ def add_newdoc(place, obj, doc, warn_on_python=True):
     routine never raises an error the caller must check manually
     that the docstrings were changed.
 
-    Since this function grabs the ``char *`` from a c-level str object and puts
-    it into the ``tp_doc`` slot of the type of `obj`, it violates a number of
-    C-API best-practices, by:
-
-    - modifying a `PyTypeObject` after calling `PyType_Ready`
-    - calling `Py_INCREF` on the str and losing the reference, so the str
-      will never be released
-
-    If possible it should be avoided.
+    Native documentation is copied into C-owned storage. Heap types own
+    their ``tp_doc`` allocation; static C metadata uses shared native text.
+    Python docstring objects are not kept alive by these native buffers.
+    This still modifies C metadata after ``PyType_Ready`` and is intended
+    primarily for NumPy's own initialization. Prefer ordinary ``__doc__``
+    assignment when the object supports it.
     """
     new = getattr(__import__(place, globals(), {}, [obj]), obj)
     if isinstance(doc, str):

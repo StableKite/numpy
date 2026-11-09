@@ -10,8 +10,21 @@
 // this file are shared by the _simd, _umath_tests, and
 // _multiarray_umath modules
 
-// Hold all CPU features boolean values
+/* Physical detection is run once and then remains immutable. Each import
+ * parses into a local candidate; dispatch configuration is published once. */
 static unsigned char npy__cpu_have[NPY_CPU_FEATURE_MAX];
+static unsigned char npy__cpu_configured[NPY_CPU_FEATURE_MAX];
+static int npy__cpu_hardware_initialized = 0;
+static int npy__cpu_configuration_initialized = 0;
+#if PY_VERSION_HEX >= 0x030d0000
+static PyMutex npy__cpu_init_mutex = {0};
+#define NPY_CPU_INIT_LOCK() PyMutex_Lock(&npy__cpu_init_mutex)
+#define NPY_CPU_INIT_UNLOCK() PyMutex_Unlock(&npy__cpu_init_mutex)
+#else
+/* Older supported runtimes retain their single-interpreter/GIL contract. */
+#define NPY_CPU_INIT_LOCK() ((void)0)
+#define NPY_CPU_INIT_UNLOCK() ((void)0)
+#endif
 
 /******************** Private Declarations *********************/
 
@@ -27,7 +40,7 @@ npy__cpu_init_features(void);
  * Raises an error if parsing fails or if the feature was not enabled or disabled
 */
 static int
-npy__cpu_check_env(int disable, const char *env);
+npy__cpu_check_env(unsigned char *configured, int disable, const char *env);
 
 /* Ensure the build's CPU baseline features are supported at runtime */
 static int
@@ -40,13 +53,24 @@ npy_cpu_have(int feature_id)
 {
     if (feature_id <= NPY_CPU_FEATURE_NONE || feature_id >= NPY_CPU_FEATURE_MAX)
         return 0;
-    return npy__cpu_have[feature_id];
+    return npy__cpu_configured[feature_id];
 }
 
 NPY_VISIBILITY_HIDDEN int
 npy_cpu_init(void)
 {
-    npy__cpu_init_features();
+    unsigned char candidate[NPY_CPU_FEATURE_MAX];
+    NPY_CPU_INIT_LOCK();
+    if (!npy__cpu_hardware_initialized) {
+        /* Architecture detection below is pure C and calls no Python API. */
+        npy__cpu_init_features();
+        npy__cpu_hardware_initialized = 1;
+    }
+    memcpy(candidate, npy__cpu_have, sizeof(candidate));
+    NPY_CPU_INIT_UNLOCK();
+
+    /* Validation/errors/warning hooks may execute Python or import another
+     * interpreter. None run while the process-wide native mutex is held. */
     if (npy__cpu_validate_baseline() < 0) {
         return -1;
     }
@@ -62,9 +86,27 @@ npy_cpu_init(void)
         return -1;
     }
     if (is_enable | is_disable) {
-        if (npy__cpu_check_env(is_disable, is_disable ? disable_env : enable_env) < 0) {
+        if (npy__cpu_check_env(candidate, is_disable,
+                is_disable ? disable_env : enable_env) < 0) {
             return -1;
         }
+    }
+
+    NPY_CPU_INIT_LOCK();
+    int mismatch = 0;
+    if (!npy__cpu_configuration_initialized) {
+        memcpy(npy__cpu_configured, candidate, sizeof(candidate));
+        npy__cpu_configuration_initialized = 1;
+    }
+    else {
+        mismatch = memcmp(npy__cpu_configured, candidate, sizeof(candidate)) != 0;
+    }
+    NPY_CPU_INIT_UNLOCK();
+    if (mismatch) {
+        PyErr_SetString(PyExc_ImportError,
+            "NumPy CPU feature configuration is already fixed by another "
+            "import in this process");
+        return -1;
     }
     return 0;
 }
@@ -149,7 +191,7 @@ npy_cpu_features_dict(void)
     if (dict) {
         for(unsigned i = 0; i < sizeof(features)/sizeof(features[0]); ++i)
             if (PyDict_SetItemString(dict, features[i].string,
-                npy__cpu_have[features[i].feature] ? Py_True : Py_False) < 0) {
+                npy__cpu_configured[features[i].feature] ? Py_True : Py_False) < 0) {
                 Py_DECREF(dict);
                 return NULL;
             }
@@ -256,7 +298,7 @@ npy__cpu_validate_baseline(void)
 }
 
 static int
-npy__cpu_check_env(int disable, const char *env) {
+npy__cpu_check_env(unsigned char *configured, int disable, const char *env) {
 
     static const char *const names[] = {
         "enable", "disable",
@@ -290,8 +332,18 @@ npy__cpu_check_env(int disable, const char *env) {
 
     //comma and space including (htab, vtab, CR, LF, FF)
     const char delim[] = ", \t\v\r\n\f";
-    char *feature = strtok(features, delim);
-    while (feature) {
+    /* A local cursor is reentrant across interpreters and warning hooks. */
+    char *cursor = features;
+    while (1) {
+        cursor += strspn(cursor, delim);
+        if (*cursor == '\0') {
+            break;
+        }
+        char *feature = cursor;
+        cursor += strcspn(cursor, delim);
+        if (*cursor != '\0') {
+            *cursor++ = '\0';
+        }
         if (npy__cpu_baseline_fid(feature) > 0){
             if (disable) {
                 PyErr_Format(PyExc_RuntimeError,
@@ -316,7 +368,7 @@ npy__cpu_check_env(int disable, const char *env) {
             goto next;
         }
         // check if the feature supported by the running machine
-        if (!npy__cpu_have[feature_id]) {
+        if (!configured[feature_id]) {
             int flen = strlen(feature);
             if (notsupp_cur != notsupp) {
                 *notsupp_cur++ = ' ';
@@ -326,15 +378,15 @@ npy__cpu_check_env(int disable, const char *env) {
             goto next;
         }
         // Finally we can disable or mark for enabling
-        npy__cpu_have[feature_id] = disable ? 0:2;
+        configured[feature_id] = disable ? 0:2;
     next:
-        feature = strtok(NULL, delim);
+        ;
     }
     if (!disable){
         // Disables any unmarked dispatched feature.
         #define NPY__CPU_DISABLE_DISPATCH_CB(FEATURE, DUMMY) \
-            if(npy__cpu_have[NPY_CAT(NPY_CPU_FEATURE_, FEATURE)] != 0)\
-            {npy__cpu_have[NPY_CAT(NPY_CPU_FEATURE_, FEATURE)]--;}\
+            if(configured[NPY_CAT(NPY_CPU_FEATURE_, FEATURE)] != 0)\
+            {configured[NPY_CAT(NPY_CPU_FEATURE_, FEATURE)]--;}\
 
         NPY_WITH_CPU_DISPATCH_CALL(NPY__CPU_DISABLE_DISPATCH_CB, DUMMY) // extra arg for msvc
     }

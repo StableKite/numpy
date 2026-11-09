@@ -33,6 +33,7 @@
 #include <numpy/ndarrayobject.h>
 #include <npy_pycompat.h>
 #include "arrayobject.h"
+#include "module_state.h"
 #include "array_coercion.h"
 #include "array_method.h"
 #include "dtypemeta.h"
@@ -442,13 +443,18 @@ PyArrayMethod_FromSpec_int(PyArrayMethod_Spec *spec, int private)
     }
 
     PyBoundArrayMethodObject *res;
-    res = PyObject_New(PyBoundArrayMethodObject, &PyBoundArrayMethod_Type);
+    res = npy_boundarraymethod_new();
     if (res == NULL) {
         return NULL;
     }
-    res->method = NULL;
-
-    res->dtypes = PyMem_Malloc(sizeof(PyArray_DTypeMeta *) * nargs);
+    res->method = npy_arraymethod_new();
+    if (res->method == NULL) {
+        Py_DECREF(res);
+        return NULL;
+    }
+    res->method->nin = spec->nin;
+    res->method->nout = spec->nout;
+    res->dtypes = PyMem_Calloc(nargs, sizeof(PyArray_DTypeMeta *));
     if (res->dtypes == NULL) {
         Py_DECREF(res);
         PyErr_NoMemory();
@@ -459,17 +465,6 @@ PyArrayMethod_FromSpec_int(PyArrayMethod_Spec *spec, int private)
         res->dtypes[i] = spec->dtypes[i];
     }
 
-    res->method = PyObject_New(PyArrayMethodObject, &PyArrayMethod_Type);
-    if (res->method == NULL) {
-        Py_DECREF(res);
-        PyErr_NoMemory();
-        return NULL;
-    }
-    memset((char *)(res->method) + offsetof(PyArrayMethodObject, name), 0,
-           sizeof(PyArrayMethodObject) - offsetof(PyArrayMethodObject, name));
-
-    res->method->nin = spec->nin;
-    res->method->nout = spec->nout;
     res->method->flags = spec->flags;
     res->method->casting = spec->casting;
     if (fill_arraymethod_from_slots(res, spec, private) < 0) {
@@ -489,39 +484,65 @@ PyArrayMethod_FromSpec_int(PyArrayMethod_Spec *spec, int private)
     // Mark immortal to reduce reference count contention in PyArray_GetCastingImpl
     // If we ever allow replacing ArrayMethod objects or cleanup it DTypes or ufuncs, this may need to be reconsidered.
     // An alternative that might help is to store cast methods in a PyArrayIdentityHash instead of a dict.
-    PyUnstable_SetImmortal((PyObject *)res->method);
+    if (PyInterpreterState_Get() == PyInterpreterState_Main()) {
+        PyUnstable_SetImmortal((PyObject *)res->method);
+    }
 #endif
     return res;
 }
 
 
+static int
+arraymethod_traverse(PyArrayMethodObject *self, visitproc visit, void *arg)
+{
+    Py_VISIT(Py_TYPE(self));
+    Py_VISIT(self->wrapped_meth);
+    if (self->wrapped_dtypes != NULL) {
+        for (int i = 0; i < self->nin + self->nout; i++) {
+            Py_VISIT(self->wrapped_dtypes[i]);
+        }
+    }
+    return 0;
+}
+
+static int
+arraymethod_clear(PyArrayMethodObject *self)
+{
+    if (self->wrapped_dtypes != NULL) {
+        for (int i = 0; i < self->nin + self->nout; i++) {
+            Py_CLEAR(self->wrapped_dtypes[i]);
+        }
+        PyMem_Free(self->wrapped_dtypes);
+        self->wrapped_dtypes = NULL;
+    }
+    Py_CLEAR(self->wrapped_meth);
+    return 0;
+}
+
 static void
 arraymethod_dealloc(PyObject *self)
 {
-    PyArrayMethodObject *meth;
-    meth = ((PyArrayMethodObject *)self);
-
-    PyMem_Free(meth->name);
-
-    if (meth->wrapped_meth != NULL) {
-        /* Cleanup for wrapping array method (defined in umath) */
-        Py_DECREF(meth->wrapped_meth);
-        for (int i = 0; i < meth->nin + meth->nout; i++) {
-            Py_XDECREF(meth->wrapped_dtypes[i]);
-        }
-        PyMem_Free(meth->wrapped_dtypes);
-    }
-
-    Py_TYPE(self)->tp_free(self);
+    PyTypeObject *type = Py_TYPE(self);
+    PyObject_GC_UnTrack(self);
+    arraymethod_clear((PyArrayMethodObject *)self);
+    PyMem_Free(((PyArrayMethodObject *)self)->name);
+    type->tp_free(self);
+    Py_DECREF(type);
 }
 
+static PyType_Slot arraymethod_slots[] = {
+    {Py_tp_dealloc, arraymethod_dealloc},
+    {Py_tp_traverse, arraymethod_traverse},
+    {Py_tp_clear, arraymethod_clear},
+    {0, NULL},
+};
 
-NPY_NO_EXPORT PyTypeObject PyArrayMethod_Type = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "numpy._ArrayMethod",
-    .tp_basicsize = sizeof(PyArrayMethodObject),
-    .tp_dealloc = arraymethod_dealloc,
-    .tp_flags = Py_TPFLAGS_DEFAULT,
+static PyType_Spec arraymethod_spec = {
+    .name = "numpy._ArrayMethod",
+    .basicsize = sizeof(PyArrayMethodObject),
+    .flags = (Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC
+              | Py_TPFLAGS_IMMUTABLETYPE | Py_TPFLAGS_DISALLOW_INSTANTIATION),
+    .slots = arraymethod_slots,
 };
 
 
@@ -542,21 +563,44 @@ boundarraymethod_repr(PyBoundArrayMethodObject *self)
 }
 
 
+static int
+boundarraymethod_traverse(PyBoundArrayMethodObject *self,
+        visitproc visit, void *arg)
+{
+    Py_VISIT(Py_TYPE(self));
+    Py_VISIT(self->method);
+    if (self->dtypes != NULL) {
+        int nargs = self->method->nin + self->method->nout;
+        for (int i = 0; i < nargs; i++) {
+            Py_VISIT(self->dtypes[i]);
+        }
+    }
+    return 0;
+}
+
+static int
+boundarraymethod_clear(PyBoundArrayMethodObject *self)
+{
+    if (self->dtypes != NULL) {
+        int nargs = self->method->nin + self->method->nout;
+        for (int i = 0; i < nargs; i++) {
+            Py_CLEAR(self->dtypes[i]);
+        }
+        PyMem_Free(self->dtypes);
+        self->dtypes = NULL;
+    }
+    Py_CLEAR(self->method);
+    return 0;
+}
+
 static void
 boundarraymethod_dealloc(PyObject *self)
 {
-    PyBoundArrayMethodObject *meth;
-    meth = ((PyBoundArrayMethodObject *)self);
-    int nargs = meth->method->nin + meth->method->nout;
-
-    for (int i = 0; i < nargs; i++) {
-        Py_XDECREF(meth->dtypes[i]);
-    }
-    PyMem_Free(meth->dtypes);
-
-    Py_XDECREF(meth->method);
-
-    Py_TYPE(self)->tp_free(self);
+    PyTypeObject *type = Py_TYPE(self);
+    PyObject_GC_UnTrack(self);
+    boundarraymethod_clear((PyBoundArrayMethodObject *)self);
+    type->tp_free(self);
+    Py_DECREF(type);
 }
 
 
@@ -985,13 +1029,60 @@ PyGetSetDef boundarraymethods_getters[] = {
 };
 
 
-NPY_NO_EXPORT PyTypeObject PyBoundArrayMethod_Type = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "numpy._BoundArrayMethod",
-    .tp_basicsize = sizeof(PyBoundArrayMethodObject),
-    .tp_dealloc = boundarraymethod_dealloc,
-    .tp_repr = (reprfunc)boundarraymethod_repr,
-    .tp_flags = Py_TPFLAGS_DEFAULT,
-    .tp_methods = boundarraymethod_methods,
-    .tp_getset = boundarraymethods_getters,
+static PyType_Slot boundarraymethod_slots[] = {
+    {Py_tp_dealloc, boundarraymethod_dealloc},
+    {Py_tp_traverse, boundarraymethod_traverse},
+    {Py_tp_clear, boundarraymethod_clear},
+    {Py_tp_repr, boundarraymethod_repr},
+    {Py_tp_methods, boundarraymethod_methods},
+    {Py_tp_getset, boundarraymethods_getters},
+    {0, NULL},
 };
+
+static PyType_Spec boundarraymethod_spec = {
+    .name = "numpy._BoundArrayMethod",
+    .basicsize = sizeof(PyBoundArrayMethodObject),
+    .flags = (Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC
+              | Py_TPFLAGS_IMMUTABLETYPE | Py_TPFLAGS_DISALLOW_INSTANTIATION),
+    .slots = boundarraymethod_slots,
+};
+
+NPY_NO_EXPORT PyTypeObject *
+_npy_get_arraymethod_type(void)
+{
+    return _npy_module_state->array_method_type;
+}
+
+NPY_NO_EXPORT PyTypeObject *
+_npy_get_boundarraymethod_type(void)
+{
+    return _npy_module_state->bound_array_method_type;
+}
+
+NPY_NO_EXPORT PyArrayMethodObject *
+npy_arraymethod_new(void)
+{
+    PyTypeObject *type = _npy_get_arraymethod_type();
+    return (PyArrayMethodObject *)type->tp_alloc(type, 0);
+}
+
+NPY_NO_EXPORT PyBoundArrayMethodObject *
+npy_boundarraymethod_new(void)
+{
+    PyTypeObject *type = _npy_get_boundarraymethod_type();
+    return (PyBoundArrayMethodObject *)type->tp_alloc(type, 0);
+}
+
+NPY_NO_EXPORT int
+init_arraymethod_types(PyObject *module)
+{
+    multiarray_umath_state *state = get_module_state(module);
+    state->array_method_type = (PyTypeObject *)PyType_FromModuleAndSpec(
+            module, &arraymethod_spec, NULL);
+    if (state->array_method_type == NULL) {
+        return -1;
+    }
+    state->bound_array_method_type = (PyTypeObject *)PyType_FromModuleAndSpec(
+            module, &boundarraymethod_spec, NULL);
+    return state->bound_array_method_type == NULL ? -1 : 0;
+}

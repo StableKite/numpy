@@ -20,6 +20,37 @@ initialize_casting_tables(void);
 NPY_NO_EXPORT void
 initialize_numeric_types(void);
 
+NPY_NO_EXPORT int
+init_abstract_scalar_types(PyObject *module);
+
+NPY_NO_EXPORT int
+init_void_scalar_type(PyObject *module);
+
+NPY_NO_EXPORT int
+init_character_scalar_types(PyObject *module);
+
+NPY_NO_EXPORT int
+init_temporal_scalar_types(PyObject *module);
+
+NPY_NO_EXPORT int
+init_numeric_scalar_types(PyObject *module);
+
+NPY_NO_EXPORT int
+init_object_scalar_type(PyObject *module);
+
+NPY_NO_EXPORT int
+init_bool_scalar_type(PyObject *module);
+
+NPY_NO_EXPORT void
+clear_bool_scalar_values(PyObject *module);
+
+NPY_NO_EXPORT void
+free_bool_scalar_pool(PyObject *module);
+
+NPY_NO_EXPORT void
+npy_configure_scalar_math(PyTypeObject *type, PyNumberMethods *methods,
+        int typenum, unaryfunc index);
+
 NPY_NO_EXPORT void
 gentype_struct_free(PyObject *ptr);
 

@@ -59,18 +59,18 @@ endif
 
 # name, sources, extra c_args, extra static libs to link
 random_pyx_sources = [
-  ['_bounded_integers', _bounded_integers_pyx, [], [npyrandom_lib, npymath_lib]],
-  ['_common', '_common.pyx', [], [npyrandom_lib]],
+  ['_bounded_integers', [_bounded_integers_pyx], [], [npyrandom_lib, npymath_lib]],
+  ['_common', ['_common.pyx'], [], [npyrandom_lib]],
   ['_mt19937', ['_mt19937.pyx', 'src/mt19937/mt19937.c', 'src/mt19937/mt19937-jump.c'],
     [], [npyrandom_lib]
   ],
   ['_philox', ['_philox.pyx', 'src/philox/philox.c'], [], [npyrandom_lib]],
   ['_pcg64', ['_pcg64.pyx', 'src/pcg64/pcg64.c'], ['-U__GNUC_GNU_INLINE__'], [npyrandom_lib]],
   ['_sfc64', ['_sfc64.pyx', 'src/sfc64/sfc64.c'], [], [npyrandom_lib]],
-  ['bit_generator', 'bit_generator.pyx', [], [npyrandom_lib]],
+  ['bit_generator', ['bit_generator.pyx'], [], [npyrandom_lib]],
   # The `fs.copyfile` usage here is needed because these two .pyx files import
   # from _bounded_integers,and its pxd file is only present in the build directory
-  ['_generator', fs.copyfile('_generator.pyx'), [], [npyrandom_lib, npymath_lib]],
+  ['_generator', [fs.copyfile('_generator.pyx')], [], [npyrandom_lib, npymath_lib]],
   ['mtrand', [
       fs.copyfile('mtrand.pyx'),
       'src/distributions/distributions.c',
@@ -79,9 +79,30 @@ random_pyx_sources = [
     ['-DNP_RANDOM_LEGACY=1'], [npymath_lib],
   ],
 ]
+random_owned_state = py.language_version().version_compare('>=3.15')
+if random_owned_state
+  if not cy.version().version_compare('==3.3.1')
+    error('The owned random code adapter currently requires Cython 3.3.1')
+  endif
+  c_args_random += ['-DCYTHON_USE_MODULE_STATE=1', '-DCYTHON_USE_TYPE_SPECS=1', '-DCYTHON_USE_FREELISTS=0']
+endif
 foreach gen: random_pyx_sources
+  random_sources = gen[1]
+  if random_owned_state
+    random_c = custom_target(gen[0] + '_owned_cython',
+      input: [random_sources[0], _cython_tree, _cython_tree_random],
+      output: gen[0] + '_owned.c',
+      command: [py, files('_cython_si.py'), '@INPUT0@', '@OUTPUT@',
+        gen[0], meson.project_source_root(), meson.project_build_root()],
+      depend_files: files('_cython_si_runtime.h'),
+    )
+    random_sources = [random_c]
+    foreach source_index: range(1, gen[1].length())
+      random_sources += [gen[1][source_index]]
+    endforeach
+  endif
   py.extension_module(gen[0],
-    [gen[1], _cython_tree, _cython_tree_random],
+    [random_sources, _cython_tree, _cython_tree_random],
     c_args: [c_args_random, gen[2]],
     include_directories: 'src',
     dependencies: np_core_dep,

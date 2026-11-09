@@ -17,7 +17,7 @@ NPY_NO_EXPORT PyObject *
 new_stringdtype_instance(PyObject *na_object, int coerce);
 
 NPY_NO_EXPORT int
-init_string_dtype(void);
+init_string_dtype(PyObject *module);
 
 // Assumes that the caller has already acquired the allocator locks for both
 // descriptors

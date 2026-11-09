@@ -11,11 +11,19 @@ import functools
 from . import _multiarray_umath, overrides
 from ._multiarray_umath import *
 
+if _multiarray_umath._supports_legacy_c_api:
+    _ARRAY_API = _multiarray_umath._ARRAY_API
+
+
+def __getattr__(name):
+    if name == '_ARRAY_API':
+        return getattr(_multiarray_umath, name)
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
 # These imports are needed for backward compatibility,
 # do not change them. issue gh-15518
 # _get_ndarray_c_version is semi-public, on purpose not added to __all__
 from ._multiarray_umath import (  # noqa: F401
-    _ARRAY_API,
     _flagdict,
     _get_madvise_hugepage,
     _get_ndarray_c_version,
@@ -48,6 +56,9 @@ __all__ = [
     'ravel_multi_index', 'result_type', 'scalar', 'set_datetimeparse_function',
     'set_typeDict', 'shares_memory', 'typeinfo',
     'unpackbits', 'unravel_index', 'vdot', 'where', 'zeros']
+
+if not _multiarray_umath._supports_legacy_c_api:
+    __all__.remove('_ARRAY_API')
 
 # For backward compatibility, make sure pickle imports
 # these functions from here

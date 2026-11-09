@@ -1,6 +1,12 @@
 #ifndef NUMPY_CORE_SRC_MULTIARRAY_DESCRIPTOR_H_
 #define NUMPY_CORE_SRC_MULTIARRAY_DESCRIPTOR_H_
 
+NPY_NO_EXPORT _PyArray_LegacyDescr *
+npy_alloc_legacy_descr(PyTypeObject *type, npy_bool zeroed);
+
+NPY_NO_EXPORT int
+init_descr_type(PyObject *module);
+
 
 /*
  * In some API calls we wish to allow users to pass a DType class or a

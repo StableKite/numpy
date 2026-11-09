@@ -713,6 +713,17 @@ PyArray_NewFromDescr_int(
     NPY_traverse_info fill_zero_info;
     NPY_traverse_info_init(&fill_zero_info);
 
+    if (_buffer_info_init_native_owner((PyObject *)fa, &fa->_buffer_info) < 0) {
+        goto fail;
+    }
+
+    /* Compile while the descriptor layout is intact and before owning data.
+     * Main static arrays keep their original allocation and GC behavior. */
+    if (data == NULL && PyObject_IS_GC((PyObject *)fa)
+            && _buffer_info_init_object_plan((PyArrayObject *)fa, descr) < 0) {
+        goto fail;
+    }
+
     if (nd > 0) {
         fa->dimensions = npy_alloc_cache_dim(2 * nd);
         if (fa->dimensions == NULL) {
@@ -2980,12 +2991,12 @@ PyArray_Zeros_int(int nd, npy_intp const *dims, PyArray_Descr *descr,
             return NULL;
         }
     }
+    else {
+        /* The constructor steals one reference. Inferred descriptors already
+         * supply it; only the caller's borrowed descriptor needs an incref. */
+        Py_INCREF(descr);
+    }
 
-    /*
-     * PyArray_NewFromDescr_int steals a ref to descr,
-     * incref so caller of this function can clean up descr
-     */
-    Py_INCREF(descr);
     ret = PyArray_NewFromDescr_int(
             &PyArray_Type, descr,
             nd, dims, NULL, NULL,
@@ -3038,12 +3049,12 @@ PyArray_Empty_int(int nd, npy_intp const *dims, PyArray_Descr *descr,
             return NULL;
         }
     }
+    else {
+        /* The constructor steals one reference. Inferred descriptors already
+         * supply it; only the caller's borrowed descriptor needs an incref. */
+        Py_INCREF(descr);
+    }
 
-    /*
-     * PyArray_NewFromDescr steals a ref to descr,
-     * incref so caller of this function can clean up descr
-     */
-    Py_INCREF(descr);
     ret = (PyArrayObject *)PyArray_NewFromDescr(&PyArray_Type,
                                                 descr, nd, dims,
                                                 NULL, NULL,

@@ -2249,14 +2249,16 @@ PyArray_SearchSorted(PyArrayObject *op1, PyObject *op2,
     PyArray_Descr *cmp_descrs[2] = {PyArray_DESCR(ap1), PyArray_DESCR(ap2)};
     npy_string_allocator *allocators[2] = {NULL, NULL};
 
+    /* Type lookup requires the attached owning interpreter. */
+    int is_string = NPY_DTYPE(PyArray_DESCR(ap2)) == &PyArray_StringDType;
     PyArray_BinSearchCompareFunc *cmp_func = &binsearch_compare_default;
-    if (NPY_DTYPE(PyArray_DESCR(ap2)) == &PyArray_StringDType) {
+    if (is_string) {
         cmp_func = &stringdtype_binsearch_compare;
     }
 
     NPY_BEGIN_THREADS_DESCR(PyArray_DESCR(ap2));
 
-    if (NPY_DTYPE(PyArray_DESCR(ap2)) == &PyArray_StringDType) {
+    if (is_string) {
         NpyString_acquire_allocators(2, cmp_descrs, allocators);
     }
 
@@ -2282,7 +2284,7 @@ PyArray_SearchSorted(PyArrayObject *op1, PyObject *op2,
                              ap1, cmp_func);
     }
 
-    if (NPY_DTYPE(PyArray_DESCR(ap2)) == &PyArray_StringDType) {
+    if (is_string) {
         NpyString_release_allocators(2, allocators);
     }
 

@@ -1,6 +1,12 @@
 #ifndef NUMPY_CORE_SRC_MULTIARRAY_ITERATORS_H_
 #define NUMPY_CORE_SRC_MULTIARRAY_ITERATORS_H_
 
+NPY_NO_EXPORT int
+init_legacy_iterator_types(PyObject *module);
+
+NPY_NO_EXPORT int
+init_neighborhood_iter_type(PyObject *module);
+
 NPY_NO_EXPORT PyObject
 *iter_subscript(PyArrayIterObject *, PyObject *);
 

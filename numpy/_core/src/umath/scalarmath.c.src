@@ -1976,7 +1976,7 @@ static PyObject*
  *          half, float, double, longdouble,
  *          cfloat, cdouble, clongdouble#
 **/
-static PyNumberMethods @name@_as_number = {
+static const PyNumberMethods @name@_as_number = {
     .nb_add = (binaryfunc)@name@_add,
     .nb_subtract = (binaryfunc)@name@_subtract,
     .nb_multiply = (binaryfunc)@name@_multiply,
@@ -1997,34 +1997,29 @@ static PyNumberMethods @name@_as_number = {
     .nb_float = (unaryfunc)@name@_float,
     .nb_floor_divide = (binaryfunc)@name@_floor_divide,
     .nb_true_divide = (binaryfunc)@name@_true_divide,
-    /* TODO: This struct/initialization should not be split between files */
-    .nb_index = (unaryfunc)NULL,  /* set in add_scalarmath below */
 };
 /**end repeat**/
 
-NPY_NO_EXPORT void
-add_scalarmath(void)
-{
+static const struct {
+    const PyNumberMethods *number;
+    richcmpfunc compare;
+} scalar_math_slots[NPY_NTYPES_LEGACY] = {
     /**begin repeat
-     *  #name = byte, ubyte, short, ushort, int, uint,
-     *          long, ulong, longlong, ulonglong,
-     *          half, float, double, longdouble,
-     *          cfloat, cdouble, clongdouble#
-     *  #NAME = Byte, UByte, Short, UShort, Int, UInt,
-     *          Long, ULong, LongLong, ULongLong,
-     *          Half, Float, Double, LongDouble,
-     *          CFloat, CDouble, CLongDouble#
-     **/
-    @name@_as_number.nb_index = Py@NAME@ArrType_Type.tp_as_number->nb_index;
-    Py@NAME@ArrType_Type.tp_as_number = &(@name@_as_number);
-    Py@NAME@ArrType_Type.tp_richcompare = @name@_richcompare;
+     * #name = byte, ubyte, short, ushort, int, uint, long, ulong, longlong,
+     *         ulonglong, half, float, double, longdouble, cfloat, cdouble, clongdouble#
+     * #typenum = BYTE, UBYTE, SHORT, USHORT, INT, UINT, LONG, ULONG, LONGLONG,
+     *            ULONGLONG, HALF, FLOAT, DOUBLE, LONGDOUBLE, CFLOAT, CDOUBLE, CLONGDOUBLE#
+     */
+    [NPY_@typenum@] = {&@name@_as_number, @name@_richcompare},
     /**end repeat**/
-}
+};
 
-
-NPY_NO_EXPORT int initscalarmath(PyObject * m)
+NPY_NO_EXPORT void
+npy_configure_scalar_math(PyTypeObject *type, PyNumberMethods *methods,
+        int typenum, unaryfunc index)
 {
-    add_scalarmath();
-
-    return 0;
+    *methods = *scalar_math_slots[typenum].number;
+    methods->nb_index = index;
+    type->tp_as_number = methods;
+    type->tp_richcompare = scalar_math_slots[typenum].compare;
 }

@@ -3,6 +3,23 @@
 
 #include "array_method.h"
 
+typedef struct npy_object_reference_plan npy_object_reference_plan;
+
+NPY_NO_EXPORT int
+npy_object_reference_plan_new(PyArray_Descr *descr, npy_object_reference_plan **result);
+
+NPY_NO_EXPORT void
+npy_object_reference_plan_free(npy_object_reference_plan *plan);
+
+/* visit == NULL relinquishes and clears each owned data reference. */
+NPY_NO_EXPORT int
+npy_object_reference_plan_apply_item(const npy_object_reference_plan *plan,
+                                     char *data, visitproc visit, void *arg);
+
+NPY_NO_EXPORT int
+npy_object_reference_plan_apply(const npy_object_reference_plan *plan,
+                                PyArrayObject *array, visitproc visit, void *arg);
+
 /* NumPy DType clear (object DECREF + NULLing) implementations */
 
 NPY_NO_EXPORT int

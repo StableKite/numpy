@@ -1235,6 +1235,7 @@ src_multiarray = multiarray_gen_headers + [
   'src/multiarray/mapping.c',
   'src/multiarray/methods.c',
   'src/multiarray/multiarraymodule.c',
+  'src/common/npy_module_state_registry.c',
   'src/multiarray/nditer_api.c',
   'src/multiarray/nditer_constr.c',
   'src/multiarray/nditer_pywrap.c',

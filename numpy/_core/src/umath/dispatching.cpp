@@ -1322,7 +1322,7 @@ logical_ufunc_promoter(PyObject *NPY_UNUSED(ufunc),
 NPY_NO_EXPORT int
 install_logical_ufunc_promoter(PyObject *ufunc)
 {
-    if (PyObject_Type(ufunc) != (PyObject *)&PyUFunc_Type) {
+    if (Py_TYPE(ufunc) != &PyUFunc_Type) {
         PyErr_SetString(PyExc_RuntimeError,
                 "internal numpy array, logical ufunc was not a ufunc?!");
         return -1;

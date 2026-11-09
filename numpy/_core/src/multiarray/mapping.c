@@ -21,6 +21,7 @@
 #include "descriptor.h"
 #include "iterators.h"
 #include "mapping.h"
+#include "module_state.h"
 #include "lowlevel_strided_loops.h"
 #include "item_selection.h"
 #include "mem_overlap.h"
@@ -2813,16 +2814,12 @@ PyArray_MapIterNew(npy_index_info *indices , int index_num, int index_type,
     }
 
     /* create new MapIter object */
-    mit = (PyArrayMapIterObject *)PyObject_Malloc(
-            sizeof(PyArrayMapIterObject) + sizeof(NPY_cast_info));
+    PyTypeObject *type = &PyArrayMapIter_Type;
+    mit = (PyArrayMapIterObject *)type->tp_alloc(type, 0);
     if (mit == NULL) {
         Py_DECREF(intp_descr);
         return NULL;
     }
-    /* set all attributes of mapiter to zero */
-    memset(mit, 0, sizeof(PyArrayMapIterObject) + sizeof(NPY_cast_info));
-    PyObject_Init((PyObject *)mit, &PyArrayMapIter_Type);
-
     Py_INCREF(arr);
     mit->array = arr;
     Py_XINCREF(subspace);
@@ -3450,6 +3447,7 @@ PyArray_MapIterArrayCopyIfOverlap(PyArrayObject * a, PyObject * index,
 static void
 arraymapiter_dealloc(PyArrayMapIterObject *mit)
 {
+    PyTypeObject *type = Py_TYPE(mit);
     PyArray_ResolveWritebackIfCopy(mit->array);
     Py_XDECREF(mit->array);
     Py_XDECREF(mit->subspace);
@@ -3463,7 +3461,8 @@ arraymapiter_dealloc(PyArrayMapIterObject *mit)
     if (mit->extra_op_iter != NULL) {
         NpyIter_Deallocate(mit->extra_op_iter);
     }
-    PyObject_Free(mit);
+    type->tp_free((PyObject *)mit);
+    Py_DECREF(type);
 }
 
 /*
@@ -3477,11 +3476,32 @@ arraymapiter_dealloc(PyArrayMapIterObject *mit)
  * removed. This is not very useful anyway, since mapiter is equivalent
  * to a[indexobj].flat but the latter gets to use slice syntax.
  */
-NPY_NO_EXPORT PyTypeObject PyArrayMapIter_Type = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "numpy.mapiter",
-    .tp_basicsize = sizeof(PyArrayMapIterObject),
-    .tp_dealloc = (destructor)arraymapiter_dealloc,
-    .tp_free = PyObject_Free,
-    .tp_flags = Py_TPFLAGS_DEFAULT,
+static PyType_Slot mapiter_slots[] = {
+    {Py_tp_dealloc, arraymapiter_dealloc},
+    {Py_tp_iter, PyObject_SelfIter},
+    {0, NULL},
 };
+
+static PyType_Spec mapiter_spec = {
+    .name = "numpy.mapiter",
+    /* The existing native implementation stores cast info just after mit. */
+    .basicsize = sizeof(PyArrayMapIterObject) + sizeof(NPY_cast_info),
+    .flags = (Py_TPFLAGS_DEFAULT | Py_TPFLAGS_IMMUTABLETYPE
+              | Py_TPFLAGS_DISALLOW_INSTANTIATION),
+    .slots = mapiter_slots,
+};
+
+NPY_NO_EXPORT PyTypeObject *
+_npy_get_mapiter_type(void)
+{
+    return _npy_module_state->mapiter_type;
+}
+
+NPY_NO_EXPORT int
+init_mapiter_type(PyObject *module)
+{
+    multiarray_umath_state *state = get_module_state(module);
+    state->mapiter_type = (PyTypeObject *)PyType_FromModuleAndSpec(
+            module, &mapiter_spec, NULL);
+    return state->mapiter_type == NULL ? -1 : 0;
+}

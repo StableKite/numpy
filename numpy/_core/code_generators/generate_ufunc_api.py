@@ -7,12 +7,13 @@ from .genapi import FunctionApi, TypeApi
 h_template = r"""
 #ifdef _UMATHMODULE
 
-extern NPY_NO_EXPORT PyTypeObject PyUFunc_Type;
-
 %s
 
 #else
 
+#if defined(NPY_API_MODULE_CONTEXT)
+#define PyUFunc_API (NPY_API_MODULE_CONTEXT->ufunc_api)
+#else
 #if defined(PY_UFUNC_UNIQUE_SYMBOL)
 #define PyUFunc_API PY_UFUNC_UNIQUE_SYMBOL
 #endif
@@ -31,12 +32,19 @@ NPY_API_SYMBOL_ATTRIBUTE void **PyUFunc_API;
 static void **PyUFunc_API=NULL;
 #endif
 #endif
+#endif /* NPY_API_MODULE_CONTEXT */
 
 %s
 
 static inline int
 _import_umath(void)
 {
+#if defined(NPY_API_MODULE_CONTEXT)
+  if (NPY_API_MODULE_CONTEXT->owner == NULL) {
+      return NPY_SI_Context_Import(NPY_API_MODULE_CONTEXT);
+  }
+  return NPY_SI_Context_Check(NPY_API_MODULE_CONTEXT);
+#else
   PyObject *c_api;
   PyObject *numpy = PyImport_ImportModule("numpy._core._multiarray_umath");
   if (numpy == NULL && PyErr_ExceptionMatches(PyExc_ModuleNotFoundError)) {
@@ -69,6 +77,7 @@ _import_umath(void)
       return -1;
   }
   return 0;
+#endif /* NPY_API_MODULE_CONTEXT */
 }
 
 #define import_umath() \
@@ -127,13 +136,21 @@ PyUFunc_ImportUFuncAPI()
 """
 
 c_template = r"""
-/* These pointers will be stored in the C-object for use in other
-    extension modules
-*/
-
-void *PyUFunc_API[] = {
+/* Each module owns a separate table, including its local ufunc type. */
+static void **
+_create_ufunc_api(void)
+{
+    void *api_table[] = {
 %s
-};
+    };
+    void **result = PyMem_Malloc(sizeof(api_table));
+    if (result == NULL) {
+        PyErr_NoMemory();
+        return NULL;
+    }
+    memcpy(result, api_table, sizeof(api_table));
+    return result;
+}
 """
 
 def generate_api(output_dir, force=False):
@@ -170,7 +187,9 @@ def do_generate_api(targets, sources):
 
     for name, val in numpy_api.ufunc_types_api.items():
         index = val[0]
-        ufunc_api_dict[name] = TypeApi(name, index, 'PyTypeObject', api_name)
+        ufunc_api_dict[name] = TypeApi(
+            name, index, 'PyTypeObject', api_name,
+            internal_getter='_npy_get_ufunc_type' if name == 'PyUFunc_Type' else None)
 
     # set up object API
     module_list = []

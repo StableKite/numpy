@@ -854,7 +854,9 @@ cdef class Generator:
         cdef int64_t *idx_data
         cdef np.npy_intp j
         cdef uint64_t set_size, mask
-        cdef uint64_t[::1] hash_set
+        # Internal np.full allocation: use an owned ndarray buffer, avoiding
+        # Cython's interpreter-global typed-memoryview runtime.
+        cdef np.ndarray[np.uint64_t, ndim=1, mode="c"] hash_set
         # Format and Verify input
         a_original = a
         a = np.asarray(a)

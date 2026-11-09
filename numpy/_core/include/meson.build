@@ -3,6 +3,7 @@ installed_headers = [
   'numpy/_public_dtype_api_table.h',
   'numpy/arrayobject.h',
   'numpy/arrayscalars.h',
+  'numpy/interpreter_context.h',
   'numpy/dtype_api.h',
   'numpy/halffloat.h',
   'numpy/ndarrayobject.h',

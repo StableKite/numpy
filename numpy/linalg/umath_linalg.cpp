@@ -12,6 +12,8 @@
 #define NPY_NO_DEPRECATED_API NPY_API_VERSION
 #include "numpy/arrayobject.h"
 #include "numpy/ufuncobject.h"
+#include "numpy/interpreter_context.h"
+#include "numpy/dtype_api.h"
 #include "numpy/npy_math.h"
 
 #include "npy_config.h"
@@ -448,9 +450,27 @@ set_fp_invalid_or_clear(int error_occurred)
     }
 }
 
+/* Borrowed only for the dynamic extent of a modern loop call. The caller
+ * owns this state until the loop returns; nested calls restore the old slot. */
+static thread_local PyThreadState *linalg_error_caller = NULL;
+
 static inline void
 report_no_memory()
 {
+    if (linalg_error_caller != NULL) {
+        PyEval_RestoreThread(linalg_error_caller);
+        PyErr_SetString(PyExc_MemoryError, "linalg native allocation failed");
+        PyThreadState *caller = PyEval_SaveThread();
+        assert(caller == linalg_error_caller);
+        return;
+    }
+#if PY_VERSION_HEX >= 0x030d0000
+    if (PyThreadState_GetUnchecked() != NULL) {
+        PyErr_NoMemory();
+        return;
+    }
+#endif
+    /* Compatibility for old direct legacy loops in the main interpreter. */
     NPY_ALLOW_C_API_DEF
     NPY_ALLOW_C_API;
     PyErr_NoMemory();
@@ -4704,42 +4724,112 @@ GUFUNC_DESCRIPTOR_t gufunc_descriptors [] = {
     }
 };
 
+typedef struct {
+    NPY_SI_Context numpy;
+} linalg_module_state;
+
+/* Entry is attached because the ArrayMethod requires the Python API.
+ * Capture the original numeric function and its thread owner before detach. */
 static int
-addUfuncs(PyObject *dictionary) {
-    PyUFuncObject *f;
-    int i;
-    const int gufunc_count = sizeof(gufunc_descriptors)/
-        sizeof(gufunc_descriptors[0]);
-    for (i = 0; i < gufunc_count; i++) {
-        GUFUNC_DESCRIPTOR_t* d = &gufunc_descriptors[i];
-        f = (PyUFuncObject *) PyUFunc_FromFuncAndDataAndSignature(
-                                                d->funcs,
-                                                array_of_nulls,
-                                                d->types,
-                                                d->ntypes,
-                                                d->nin,
-                                                d->nout,
-                                                PyUFunc_None,
-                                                d->name,
-                                                d->doc,
-                                                0,
-                                                d->signature);
-        if (f == NULL) {
+owned_linalg_loop(PyArrayMethod_Context *context, char *const *args,
+        const npy_intp *dimensions, const npy_intp *strides, NpyAuxData *)
+{
+    if (context->caller == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "linalg loop requires its ufunc caller");
+        return -1;
+    }
+    auto ufunc = (PyUFuncObject *)context->caller;
+    int selected = -1;
+    for (int loop = 0; loop < ufunc->ntypes; loop++) {
+        bool match = true;
+        for (int arg = 0; arg < ufunc->nargs; arg++) {
+            if (context->descriptors[arg]->type_num != ufunc->types[loop*ufunc->nargs+arg]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            selected = loop;
+            break;
+        }
+    }
+    if (selected < 0) {
+        PyErr_SetString(PyExc_RuntimeError, "no native linalg loop for resolved descriptors");
+        return -1;
+    }
+    auto function = ufunc->functions[selected];
+    void *data = ufunc->data == NULL ? NULL : ufunc->data[selected];
+    PyThreadState *previous = linalg_error_caller;
+    PyThreadState *caller = PyEval_SaveThread();
+    linalg_error_caller = caller;
+    function(const_cast<char **>(args), dimensions, strides, data);
+    linalg_error_caller = previous;
+    PyEval_RestoreThread(caller);
+    return PyErr_Occurred() == NULL ? 0 : -1;
+}
+
+static int
+addUfuncs(PyObject *dictionary, NPY_SI_Context *context)
+{
+    typedef PyObject *(*constructor_func)(PyUFuncGenericFunction *, void *const *,
+            const char *, int, int, int, int, const char *, const char *, int, const char *);
+    typedef int (*add_loop_func)(PyObject *, PyArrayMethod_Spec *);
+    typedef PyArray_Descr *(*descr_from_type_func)(int);
+    auto constructor = (constructor_func)context->ufunc_api[31];
+    auto add_loop = (add_loop_func)context->ufunc_api[43];
+    auto descr_from_type = (descr_from_type_func)context->array_api[45];
+    const int count = sizeof(gufunc_descriptors)/sizeof(gufunc_descriptors[0]);
+    for (int index = 0; index < count; index++) {
+        auto definition = &gufunc_descriptors[index];
+        PyObject *function = constructor(NULL, NULL, NULL, 0, definition->nin,
+                definition->nout, PyUFunc_None, definition->name, definition->doc,
+                0, definition->signature);
+        if (function == NULL) {
             return -1;
         }
-        f->process_core_dims_func = d->process_core_dims_func;
-#if _UMATH_LINALG_DEBUG
-        dump_ufunc_object((PyUFuncObject*) f);
-#endif
-        int ret = PyDict_SetItemString(dictionary, d->name, (PyObject *)f);
-        Py_DECREF(f);
-        if (ret < 0) {
+        int nargs = definition->nin + definition->nout;
+        for (int loop = 0; loop < definition->ntypes; loop++) {
+            PyArray_DTypeMeta *dtypes[NPY_MAXARGS];
+            PyArray_Descr *descriptors[NPY_MAXARGS] = {};
+            int arg = 0;
+            for (; arg < nargs; arg++) {
+                descriptors[arg] = descr_from_type(definition->types[loop*nargs+arg]);
+                if (descriptors[arg] == NULL) {
+                    break;
+                }
+                dtypes[arg] = (PyArray_DTypeMeta *)Py_TYPE(descriptors[arg]);
+            }
+            int result = -1;
+            if (arg == nargs) {
+                PyType_Slot slots[] = {
+                    {NPY_METH_strided_loop, (void *)owned_linalg_loop}, {0, NULL}};
+                PyArrayMethod_Spec spec = {definition->name, definition->nin,
+                    definition->nout, NPY_NO_CASTING, NPY_METH_REQUIRES_PYAPI,
+                    dtypes, slots};
+                result = add_loop(function, &spec);
+            }
+            for (int owned = 0; owned < arg; owned++) {
+                Py_DECREF(descriptors[owned]);
+            }
+            if (result < 0) {
+                Py_DECREF(function);
+                return -1;
+            }
+        }
+        auto ufunc = (PyUFuncObject *)function;
+        ufunc->functions = definition->funcs;
+        ufunc->data = array_of_nulls;
+        ufunc->types = definition->types;
+        ufunc->ntypes = definition->ntypes;
+        ufunc->process_core_dims_func = definition->process_core_dims_func;
+        int result = PyDict_SetItemString(dictionary, definition->name, function);
+        Py_DECREF(function);
+        if (result < 0) {
             return -1;
         }
     }
     return 0;
 }
-
 
 
 /* -------------------------------------------------------------------------- */
@@ -4749,7 +4839,30 @@ static PyMethodDef UMath_LinAlgMethods[] = {
     {NULL, NULL, 0, NULL}        /* Sentinel */
 };
 
+#if PY_VERSION_HEX < 0x030f0000
 static int module_loaded = 0;
+#endif
+
+static int
+linalg_module_traverse(PyObject *module, visitproc visit, void *arg)
+{
+    auto *state = (linalg_module_state *)PyModule_GetState(module);
+    return NPY_SI_Context_Traverse(&state->numpy, visit, arg);
+}
+
+static int
+linalg_module_clear(PyObject *module)
+{
+    auto *state = (linalg_module_state *)PyModule_GetState(module);
+    NPY_SI_Context_Clear(&state->numpy);
+    return 0;
+}
+
+static void
+linalg_module_free(void *module)
+{
+    linalg_module_clear((PyObject *)module);
+}
 
 static int
 _umath_linalg_exec(PyObject *m)
@@ -4757,18 +4870,17 @@ _umath_linalg_exec(PyObject *m)
     PyObject *d;
     PyObject *version;
 
-    // https://docs.python.org/3/howto/isolating-extensions.html#opt-out-limiting-to-one-module-object-per-process
+#if PY_VERSION_HEX < 0x030f0000
+    // Preserve older runtimes' existing single-module contract.
     if (module_loaded) {
         PyErr_SetString(PyExc_ImportError,
                         "cannot load module more than once per process");
         return -1;
     }
     module_loaded = 1;
-
-    if (PyArray_ImportNumPyAPI() < 0) {
-        return -1;
-    }
-    if (PyUFunc_ImportUFuncAPI() < 0) {
+#endif
+    auto *state = (linalg_module_state *)PyModule_GetState(m);
+    if (NPY_SI_Context_Import(&state->numpy) < 0) {
         return -1;
     }
 
@@ -4788,7 +4900,7 @@ _umath_linalg_exec(PyObject *m)
     }
 
     /* Load the ufunc operators into the module's namespace */
-    if (addUfuncs(d) < 0) {
+    if (addUfuncs(d, &state->numpy) < 0) {
         return -1;
     }
 
@@ -4812,7 +4924,11 @@ _umath_linalg_exec(PyObject *m)
 static struct PyModuleDef_Slot _umath_linalg_slots[] = {
     {Py_mod_exec, (void*)_umath_linalg_exec},
 #if PY_VERSION_HEX >= 0x030c00f0  // Python 3.12+
+#if PY_VERSION_HEX >= 0x030f0000
+    {Py_mod_multiple_interpreters, Py_MOD_PER_INTERPRETER_GIL_SUPPORTED},
+#else
     {Py_mod_multiple_interpreters, Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED},
+#endif
 #endif
 #if PY_VERSION_HEX >= 0x030d00f0  // Python 3.13+
     // signal that this module supports running without an active GIL
@@ -4825,9 +4941,12 @@ static struct PyModuleDef moduledef = {
     PyModuleDef_HEAD_INIT,  /* m_base */
     "_umath_linalg",        /* m_name */
     NULL,                   /* m_doc */
-    0,                      /* m_size */
+    sizeof(linalg_module_state),  /* m_size */
     UMath_LinAlgMethods,    /* m_methods */
     _umath_linalg_slots,    /* m_slots */
+    linalg_module_traverse, /* m_traverse */
+    linalg_module_clear,    /* m_clear */
+    linalg_module_free,     /* m_free */
 };
 
 PyMODINIT_FUNC PyInit__umath_linalg(void) {

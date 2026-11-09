@@ -13,6 +13,7 @@
 #include "array_coercion.h"
 #include "common.h"
 #include "npy_pycompat.h"
+#include "module_state.h"
 
 
 static inline PyArray_Descr *
@@ -83,12 +84,6 @@ discover_descriptor_from_pycomplex(
 }
 
 
-NPY_NO_EXPORT PyArray_DTypeMeta *PyArray_IntAbstractDTypePtr = NULL;
-NPY_NO_EXPORT PyArray_DTypeMeta *PyArray_FloatAbstractDTypePtr = NULL;
-NPY_NO_EXPORT PyArray_DTypeMeta *PyArray_ComplexAbstractDTypePtr = NULL;
-NPY_NO_EXPORT PyArray_DTypeMeta *PyArray_PyLongDTypePtr = NULL;
-NPY_NO_EXPORT PyArray_DTypeMeta *PyArray_PyFloatDTypePtr = NULL;
-NPY_NO_EXPORT PyArray_DTypeMeta *PyArray_PyComplexDTypePtr = NULL;
 
 
 /*
@@ -248,7 +243,7 @@ static NPY_DType_Slots pycomplexdtype_slots = {
  * non-NULL the new DType is also registered for scalar discovery.
  */
 static PyArray_DTypeMeta *
-make_raw_dtype(const char *name, PyTypeObject *base,
+make_raw_dtype(PyObject *module, const char *name, PyTypeObject *base,
                npy_uint64 flags, NPY_DType_Slots *slots,
                PyTypeObject *scalar_type)
 {
@@ -258,7 +253,7 @@ make_raw_dtype(const char *name, PyTypeObject *base,
     };
     PyType_Spec spec = {
         .name = name,
-        .basicsize = sizeof(PyArray_Descr),
+        .basicsize = (int)PyArrayDescr_Type.tp_basicsize,
         .itemsize = 0,
         .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_IMMUTABLETYPE,
         .slots = type_slots,
@@ -268,7 +263,7 @@ make_raw_dtype(const char *name, PyTypeObject *base,
         spec.flags |= Py_TPFLAGS_BASETYPE | Py_TPFLAGS_DISALLOW_INSTANTIATION;
     }
     PyArray_DTypeMeta *dt = (PyArray_DTypeMeta *)PyType_FromMetaclass(
-            &PyArrayDTypeMeta_Type, NULL, &spec, NULL);
+            &PyArrayDTypeMeta_Type, module, &spec, NULL);
     if (dt == NULL) {
         return NULL;
     }
@@ -308,11 +303,12 @@ make_raw_dtype(const char *name, PyTypeObject *base,
  * inherits from the abstract DTypes created here.
  */
 NPY_NO_EXPORT int
-initialize_abstract_dtypes(void)
+initialize_abstract_dtypes(PyObject *module)
 {
+    multiarray_umath_state *state = get_module_state(module);
     struct dtype_spec {
         const char *name;
-        PyArray_DTypeMeta **out;
+        PyTypeObject **out;
         /* Indirected so Py-scalar entries below can reference an abstract
          * DType created earlier in the same loop iteration. */
         PyTypeObject **base_ptr;
@@ -324,26 +320,26 @@ initialize_abstract_dtypes(void)
 
     struct dtype_spec specs[] = {
         /* Abstract DTypes; concrete legacy DTypes may inherit from these. */
-        {"numpy.dtypes._IntegerAbstractDType", &PyArray_IntAbstractDTypePtr,
+        {"numpy.dtypes._IntegerAbstractDType", &state->integer_abstract_dtype,
             &descr_base, NPY_DT_ABSTRACT, NULL, NULL},
-        {"numpy.dtypes._FloatAbstractDType", &PyArray_FloatAbstractDTypePtr,
+        {"numpy.dtypes._FloatAbstractDType", &state->float_abstract_dtype,
             &descr_base, NPY_DT_ABSTRACT, NULL, NULL},
-        {"numpy.dtypes._ComplexAbstractDType", &PyArray_ComplexAbstractDTypePtr,
+        {"numpy.dtypes._ComplexAbstractDType", &state->complex_abstract_dtype,
             &descr_base, NPY_DT_ABSTRACT, NULL, NULL},
         /* Py-scalar DTypes; bases are the abstract DTypes created above. */
-        {"numpy.dtypes._PyLongDType", &PyArray_PyLongDTypePtr,
-            (PyTypeObject **)&PyArray_IntAbstractDTypePtr,
+        {"numpy.dtypes._PyLongDType", &state->pylong_dtype,
+            (PyTypeObject **)&state->integer_abstract_dtype,
             0, &pylongdtype_slots, &PyLong_Type},
-        {"numpy.dtypes._PyFloatDType", &PyArray_PyFloatDTypePtr,
-            (PyTypeObject **)&PyArray_FloatAbstractDTypePtr,
+        {"numpy.dtypes._PyFloatDType", &state->pyfloat_dtype,
+            (PyTypeObject **)&state->float_abstract_dtype,
             0, &pyfloatdtype_slots, &PyFloat_Type},
-        {"numpy.dtypes._PyComplexDType", &PyArray_PyComplexDTypePtr,
-            (PyTypeObject **)&PyArray_ComplexAbstractDTypePtr,
+        {"numpy.dtypes._PyComplexDType", &state->pycomplex_dtype,
+            (PyTypeObject **)&state->complex_abstract_dtype,
             0, &pycomplexdtype_slots, &PyComplex_Type},
     };
     for (size_t i = 0; i < sizeof(specs) / sizeof(specs[0]); i++) {
-        *specs[i].out = make_raw_dtype(
-                specs[i].name, *specs[i].base_ptr, specs[i].flags,
+        *specs[i].out = (PyTypeObject *)make_raw_dtype(
+                module, specs[i].name, *specs[i].base_ptr, specs[i].flags,
                 specs[i].slots, specs[i].scalar_type);
         if (*specs[i].out == NULL) {
             return -1;

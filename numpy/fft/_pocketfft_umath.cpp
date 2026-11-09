@@ -17,6 +17,8 @@
 
 #include "numpy/arrayobject.h"
 #include "numpy/ufuncobject.h"
+#include "numpy/dtype_api.h"
+#include "numpy/interpreter_context.h"
 
 #include "npy_config.h"
 
@@ -340,77 +342,159 @@ static const char irfft_types[] = {
     NPY_CLONGDOUBLE, NPY_LONGDOUBLE, NPY_LONGDOUBLE
 };
 
-static int
-add_gufuncs(PyObject *dictionary) {
-    PyObject *f;
+typedef struct {
+    NPY_SI_Context numpy;
+} pocketfft_module_state;
 
-    f = PyUFunc_FromFuncAndDataAndSignature(
-        fft_functions, fft_data, fft_types, 3, 2, 1, PyUFunc_None,
-        "fft", "complex forward FFT\n", 0, "(n),()->(m)");
-    if (f == NULL) {
+/* The public ArrayMethod keeps the caller attached on entry. Detach only for
+ * the pure C++ computation and restore that exact thread state on every exit.
+ * PyGILState_Ensure cannot select a detached subinterpreter's owning state. */
+template<PyUFuncGenericFunction cpp_ufunc, bool forward>
+static int
+owned_fft_loop(PyArrayMethod_Context *, char *const *args,
+        const npy_intp *dimensions, const npy_intp *strides, NpyAuxData *)
+{
+    bool direction = forward;
+    PyThreadState *caller = PyEval_SaveThread();
+    try {
+        cpp_ufunc(const_cast<char **>(args), dimensions, strides, &direction);
+    }
+    catch (const std::bad_alloc&) {
+        PyEval_RestoreThread(caller);
+        PyErr_SetString(PyExc_MemoryError, "pocketfft C++ allocation failed");
         return -1;
     }
-    PyDict_SetItemString(dictionary, "fft", f);
-    Py_DECREF(f);
-    f = PyUFunc_FromFuncAndDataAndSignature(
-        fft_functions, ifft_data, fft_types, 3, 2, 1, PyUFunc_None,
-        "ifft", "complex backward FFT\n", 0, "(m),()->(n)");
-    if (f == NULL) {
+    catch (const std::exception& error) {
+        PyEval_RestoreThread(caller);
+        PyErr_SetString(PyExc_RuntimeError, error.what());
         return -1;
     }
-    PyDict_SetItemString(dictionary, "ifft", f);
-    Py_DECREF(f);
-    f = PyUFunc_FromFuncAndDataAndSignature(
-        rfft_n_even_functions, NULL, rfft_types, 3, 2, 1, PyUFunc_None,
-        "rfft_n_even", "real forward FFT for even n\n", 0, "(n),()->(m)");
-    if (f == NULL) {
+    catch (...) {
+        PyEval_RestoreThread(caller);
+        PyErr_SetString(PyExc_RuntimeError, "unknown pocketfft C++ exception");
         return -1;
     }
-    PyDict_SetItemString(dictionary, "rfft_n_even", f);
-    Py_DECREF(f);
-    f = PyUFunc_FromFuncAndDataAndSignature(
-        rfft_n_odd_functions, NULL, rfft_types, 3, 2, 1, PyUFunc_None,
-        "rfft_n_odd", "real forward FFT for odd n\n", 0, "(n),()->(m)");
-    if (f == NULL) {
-        return -1;
-    }
-    PyDict_SetItemString(dictionary, "rfft_n_odd", f);
-    Py_DECREF(f);
-    f = PyUFunc_FromFuncAndDataAndSignature(
-        irfft_functions, NULL, irfft_types, 3, 2, 1, PyUFunc_None,
-        "irfft", "real backward FFT\n", 0, "(m),()->(n)");
-    if (f == NULL) {
-        return -1;
-    }
-    PyDict_SetItemString(dictionary, "irfft", f);
-    Py_DECREF(f);
+    PyEval_RestoreThread(caller);
     return 0;
 }
 
+static int
+add_gufuncs(PyObject *dictionary, NPY_SI_Context *context)
+{
+    typedef PyObject *(*constructor_func)(PyUFuncGenericFunction *, void *const *,
+            const char *, int, int, int, int, const char *, const char *, int, const char *);
+    typedef int (*add_loop_func)(PyObject *, PyArrayMethod_Spec *);
+    auto constructor = (constructor_func)context->ufunc_api[31];
+    auto add_loop = (add_loop_func)context->ufunc_api[43];
+    struct definition {
+        const char *name, *doc, *signature;
+        PyUFuncGenericFunction *legacy_functions;
+        void *const *legacy_data;
+        const char *types;
+        PyArrayMethod_StridedLoop *loops[3];
+        bool real_input, real_output;
+    } definitions[] = {
+        {"fft", "complex forward FFT\n", "(n),()->(m)", fft_functions, fft_data, fft_types,
+            {owned_fft_loop<fft_loop<npy_double>, true>, owned_fft_loop<fft_loop<npy_float>, true>,
+             owned_fft_loop<fft_loop<npy_longdouble>, true>}, false, false},
+        {"ifft", "complex backward FFT\n", "(m),()->(n)", fft_functions, ifft_data, fft_types,
+            {owned_fft_loop<fft_loop<npy_double>, false>, owned_fft_loop<fft_loop<npy_float>, false>,
+             owned_fft_loop<fft_loop<npy_longdouble>, false>}, false, false},
+        {"rfft_n_even", "real forward FFT for even n\n", "(n),()->(m)", rfft_n_even_functions, NULL, rfft_types,
+            {owned_fft_loop<rfft_n_even_loop<npy_double>, true>, owned_fft_loop<rfft_n_even_loop<npy_float>, true>,
+             owned_fft_loop<rfft_n_even_loop<npy_longdouble>, true>}, true, false},
+        {"rfft_n_odd", "real forward FFT for odd n\n", "(n),()->(m)", rfft_n_odd_functions, NULL, rfft_types,
+            {owned_fft_loop<rfft_n_odd_loop<npy_double>, true>, owned_fft_loop<rfft_n_odd_loop<npy_float>, true>,
+             owned_fft_loop<rfft_n_odd_loop<npy_longdouble>, true>}, true, false},
+        {"irfft", "real backward FFT\n", "(m),()->(n)", irfft_functions, NULL, irfft_types,
+            {owned_fft_loop<irfft_loop<npy_double>, false>, owned_fft_loop<irfft_loop<npy_float>, false>,
+             owned_fft_loop<irfft_loop<npy_longdouble>, false>}, false, true},
+    };
+    /* Existing public dtype API slots: double/float/longdouble and their
+     * complex partners. Addresses are borrowed from this module's owner. */
+    const int real_slots[3] = {344, 343, 345};
+    const int complex_slots[3] = {347, 346, 348};
+    for (auto &definition : definitions) {
+        PyObject *function = constructor(NULL, NULL, NULL, 0, 2, 1, PyUFunc_None,
+                definition.name, definition.doc, 0, definition.signature);
+        if (function == NULL) {
+            return -1;
+        }
+        for (int index = 0; index < 3; index++) {
+            auto real = (PyArray_DTypeMeta *)context->array_api[real_slots[index]];
+            auto complex = (PyArray_DTypeMeta *)context->array_api[complex_slots[index]];
+            PyArray_DTypeMeta *dtypes[3] = {
+                definition.real_input ? real : complex, real,
+                definition.real_output ? real : complex};
+            PyType_Slot slots[] = {
+                {NPY_METH_strided_loop, (void *)definition.loops[index]}, {0, NULL}};
+            PyArrayMethod_Spec spec = {definition.name, 2, 1, NPY_NO_CASTING,
+                NPY_METH_REQUIRES_PYAPI, dtypes, slots};
+            if (add_loop(function, &spec) < 0) {
+                Py_DECREF(function);
+                return -1;
+            }
+        }
+        /* Preserve the old native ufunc's legacy type/signature introspection.
+         * Normal dispatch uses the owned modern loops registered above. */
+        auto ufunc = (PyUFuncObject *)function;
+        ufunc->functions = definition.legacy_functions;
+        ufunc->data = definition.legacy_data;
+        ufunc->types = definition.types;
+        ufunc->ntypes = 3;
+        int result = PyDict_SetItemString(dictionary, definition.name, function);
+        Py_DECREF(function);
+        if (result < 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int
+pocketfft_traverse(PyObject *module, visitproc visit, void *arg)
+{
+    auto state = (pocketfft_module_state *)PyModule_GetState(module);
+    return NPY_SI_Context_Traverse(&state->numpy, visit, arg);
+}
+
+static int
+pocketfft_clear(PyObject *module)
+{
+    auto state = (pocketfft_module_state *)PyModule_GetState(module);
+    NPY_SI_Context_Clear(&state->numpy);
+    return 0;
+}
+
+static void
+pocketfft_free(void *module)
+{
+    pocketfft_clear((PyObject *)module);
+}
+
+#if PY_VERSION_HEX < 0x030f0000
 static int module_loaded = 0;
+#endif
 
 static int
 _pocketfft_umath_exec(PyObject *m)
 {
-    // https://docs.python.org/3/howto/isolating-extensions.html#opt-out-limiting-to-one-module-object-per-process
+#if PY_VERSION_HEX < 0x030f0000
+    // Preserve older runtimes' single-module contract.
     if (module_loaded) {
         PyErr_SetString(PyExc_ImportError,
                         "cannot load module more than once per process");
         return -1;
     }
     module_loaded = 1;
+#endif
 
-    /* Import the array and ufunc objects */
-    if (PyArray_ImportNumPyAPI() < 0) {
+    auto state = (pocketfft_module_state *)PyModule_GetState(m);
+    if (NPY_SI_Context_Import(&state->numpy) < 0) {
         return -1;
     }
-    if (PyUFunc_ImportUFuncAPI() < 0) {
-        return -1;
-    }
-
-    PyObject *d = PyModule_GetDict(m);
-    if (add_gufuncs(d) < 0) {
-        Py_DECREF(d);
+    PyObject *dictionary = PyModule_GetDict(m);
+    if (dictionary == NULL || add_gufuncs(dictionary, &state->numpy) < 0) {
         return -1;
     }
 
@@ -420,7 +504,11 @@ _pocketfft_umath_exec(PyObject *m)
 static struct PyModuleDef_Slot _pocketfft_umath_slots[] = {
     {Py_mod_exec, (void*)_pocketfft_umath_exec},
 #if PY_VERSION_HEX >= 0x030c00f0  // Python 3.12+
+#if PY_VERSION_HEX >= 0x030f0000
+    {Py_mod_multiple_interpreters, Py_MOD_PER_INTERPRETER_GIL_SUPPORTED},
+#else
     {Py_mod_multiple_interpreters, Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED},
+#endif
 #endif
 #if PY_VERSION_HEX >= 0x030d00f0  // Python 3.13+
     // signal that this module supports running without an active GIL
@@ -433,9 +521,12 @@ static struct PyModuleDef moduledef = {
     PyModuleDef_HEAD_INIT,  /* m_base */
     "_pocketfft_umath",     /* m_name */
     NULL,                   /* m_doc */
-    0,                      /* m_size */
+    sizeof(pocketfft_module_state), /* m_size */
     NULL,                   /* m_methods */
     _pocketfft_umath_slots, /* m_slots */
+    pocketfft_traverse,
+    pocketfft_clear,
+    pocketfft_free,
 };
 
 PyMODINIT_FUNC PyInit__pocketfft_umath(void) {

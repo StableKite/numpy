@@ -11597,19 +11597,39 @@ class TestSubinterpreterTeardown:
     """
 
     @pytest.mark.skipif(IS_WASM, reason="no subinterpreter support in wasm")
-    def test_subinterpreter_import_fails_cleanly(self):
-        # concurrent.interpreters is Python 3.14+
+    def test_subinterpreter_native_import_contract(self):
         interpreters = pytest.importorskip("concurrent.interpreters")
         interp = interpreters.create()
+        core = np._core._multiarray_umath
+        registry_before = core._get_context_registry_size()
         try:
-            with pytest.raises(interpreters.ExecutionFailed) as exc:
-                interp.exec("import numpy")
-            # numpy rewraps every C-extension ImportError in a generic
-            # message, so the type alone would also pass for a broken build.
-            msg = exc.value.excinfo.msg
-            assert "does not support loading in subinterpreters" in msg, msg
+            if sys.version_info >= (3, 15):
+                interp.exec(f"expected_gil = {sys._is_gil_enabled()!r}\n" + """
+import pickle
+import sys
+import numpy as np
+from numpy._core import _multiarray_umath as core
+assert sys._is_gil_enabled() == expected_gil
+assert core._supports_legacy_c_api is False
+assert '_ARRAY_API' not in vars(core) and '_UFUNC_API' not in vars(core)
+a = np.arange(6).reshape(2, 3)
+assert a.sum() == 15
+assert pickle.loads(pickle.dumps(a)).tolist() == a.tolist()
+assert np.linalg.det(np.eye(2)) == 1
+assert sys._is_gil_enabled() == expected_gil
+""")
+                assert core._get_context_registry_size() == registry_before + 1
+            else:
+                with pytest.raises(interpreters.ExecutionFailed) as exc:
+                    interp.exec("import numpy")
+                msg = exc.value.excinfo.msg
+                assert "does not support loading in subinterpreters" in msg, msg
         finally:
             interp.close()
+        for _ in range(3):
+            gc.collect()
+        assert core._get_context_registry_size() == registry_before
+
 
 
 class TestArrayConverter:
@@ -11633,3 +11653,274 @@ class TestArrayConverter:
         conv = _array_converter([1, 2, 3])
         with pytest.raises(ValueError, match="invalid pyscalar mode"):
             conv.as_arrays(pyscalars="invalid")
+
+
+def _gc_array_construct(mode, array_type):
+    class Holder:
+        pass
+
+    class BufferOwner(bytearray):
+        pass
+
+    if mode == "numeric-base":
+        owner = BufferOwner(3 * np.dtype("float32").itemsize)
+        array = array_type((3,), dtype="float32", buffer=owner)
+        assert array.base is owner and not array.flags.owndata
+        owner.array = array
+        refs = [weakref.ref(owner), weakref.ref(array)]
+    elif mode == "self-object":
+        array = array_type((1,), dtype=object)
+        assert array.flags.owndata
+        array[0] = array
+        refs = [weakref.ref(array)]
+    elif mode == "view-object":
+        owner = Holder()
+        backing = array_type((1,), dtype=object)
+        backing[0] = owner
+        array = backing.view(array_type)
+        assert array.base is backing and not array.flags.owndata
+        owner.array = array
+        refs = [weakref.ref(owner), weakref.ref(array), weakref.ref(backing)]
+    else:
+        owner = Holder()
+        if mode == "object-holder":
+            array = array_type((1,), dtype=object)
+            array[0] = owner
+        elif mode == "fortran-object":
+            array = array_type((2, 3), dtype=object, order="F")
+            array[1, 2] = owner
+        elif mode == "unaligned-object":
+            array = array_type((1,), dtype=[("tag", "u1"), ("value", object)])
+            assert array.dtype.fields["value"][1] == 1
+            array["value"][0] = owner
+        elif mode == "subarray-object":
+            array = array_type((1,), dtype=[("value", object, (2, 3))])
+            array["value"][0, 1, 2] = owner
+        elif mode == "deep-structured-object":
+            dtype = np.dtype(object)
+            for _ in range(64):
+                dtype = np.dtype([("value", dtype)])
+            array = array_type((1,), dtype=dtype)
+            view = array
+            for _ in range(64):
+                view = view["value"]
+            view[0] = owner
+        else:
+            array = array_type((1,), dtype=[("value", object), ("number", "i8")])
+            array["value"][0] = owner
+        assert array.flags.owndata
+        owner.array = array
+        refs = [weakref.ref(owner), weakref.ref(array)]
+    assert gc.is_tracked(array)
+    return refs
+
+
+def _gc_array_sever(mode, refs):
+    value = refs[0]()
+    if value is None:
+        return
+    if mode == "self-object":
+        value[0] = None
+    else:
+        value.array = None
+
+
+@pytest.mark.parametrize("mode", [
+    "numeric-base", "object-holder", "self-object", "structured-object",
+    "view-object", "fortran-object", "unaligned-object", "subarray-object",
+    "deep-structured-object",
+])
+@pytest.mark.parametrize("factory", ["python", "native"])
+def test_heap_array_gc_owned_references(mode, factory):
+    if factory == "python":
+        class Array(np.ndarray):
+            pass
+    else:
+        Array = _multiarray_tests.create_heap_array_gc_type()
+
+    type_ref = weakref.ref(Array)
+    refs = _gc_array_construct(mode, Array)
+    try:
+        for _ in range(3):
+            gc.collect()
+        assert all(ref() is None for ref in refs)
+        # Weakrefs are cleared before tp_clear; also require actual removal
+        # of every still-tracked ndarray instance from the GC generation.
+        assert sum(type(value) is Array for value in gc.get_objects()) == 0
+    finally:
+        _gc_array_sever(mode, refs)
+        gc.collect()
+    del Array
+    gc.collect()
+    assert type_ref() is None
+
+
+def test_heap_array_gc_view_preserves_owner_data():
+    class Array(np.ndarray):
+        pass
+
+    class Holder:
+        pass
+
+    parent = Array((2,), dtype=object)
+    payload = Holder()
+    parent[:] = payload
+    view = parent.view(Array)
+    view.self = view
+    view_ref = weakref.ref(view)
+    del view
+    gc.collect()
+    assert view_ref() is None
+    assert parent[0] is parent[1] is payload
+
+
+@pytest.mark.parametrize("mode", ["dealloc", "gc"])
+@pytest.mark.parametrize("export_buffer", [False, True])
+@pytest.mark.parametrize("construction", ["new", "setstate"])
+@pytest.mark.parametrize("layout", ["object", "empty", "empty-only"])
+def test_heap_array_gc_public_lifetime(mode, export_buffer, construction, layout):
+    import subprocess
+    import textwrap
+
+    script = textwrap.dedent("""
+        import gc, sys, weakref
+        import numpy as np
+
+        class Array(np.ndarray):
+            pass
+        class Holder:
+            pass
+
+        if LAYOUT == 'object':
+            dtype = np.dtype([('tag', 'u1'), ('value', object, (2, 3))])
+        elif LAYOUT == 'empty':
+            dtype = np.dtype([('empty', object, (0,)), ('number', 'i4')])
+        else:
+            dtype = np.dtype([('empty', object, (0,))])
+        if CONSTRUCTION == 'setstate':
+            initial = Array((2, 3), dtype=dtype)
+            array = Array((0,), dtype='u1')
+            array.__setstate__(initial.__reduce__()[2])
+            del initial
+        else:
+            array = Array((2, 3), dtype=dtype)
+        owner = Holder()
+        if LAYOUT == 'object':
+            array['value'][1, 2, 1, 2] = owner
+        else:
+            array.owner = owner
+        refs = [weakref.ref(array), weakref.ref(owner)]
+        if MODE == 'gc':
+            owner.array = array
+        del owner
+        if EXPORT_BUFFER:
+            first = memoryview(array)
+            assert first.ndim == 2
+            first.release()
+            array.shape = (6,)
+            second = memoryview(array)
+            assert second.ndim == 1
+            second.release()
+        del array
+        if MODE == 'gc':
+            for _ in range(3):
+                gc.collect()
+        assert all(ref() is None for ref in refs)
+        assert not [value for value in gc.get_objects() if type(value) is Array]
+    """).replace("MODE", repr(mode)).replace("EXPORT_BUFFER", repr(export_buffer)).replace("CONSTRUCTION", repr(construction)).replace("LAYOUT", repr(layout))
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", script],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_heap_array_gc_large_subarray():
+    import gc
+    import weakref
+
+    class Array(np.ndarray):
+        pass
+
+    # The reference plan scales with dtype structure, not this repeat count.
+    array = Array((0,), dtype=[('values', object, (10**8,))])
+    assert array.nbytes == 0
+    array.owner = array
+    ref = weakref.ref(array)
+    del array
+    for _ in range(3):
+        gc.collect()
+    assert ref() is None
+    assert not [value for value in gc.get_objects() if type(value) is Array]
+
+
+def test_heap_array_gc_wide_record():
+    import gc
+    import weakref
+
+    class Array(np.ndarray):
+        pass
+    class Holder:
+        pass
+
+    array = Array((1,), dtype=[(f"field{i}", object) for i in range(10_000)])
+    owner = Holder()
+    array['field9999'][0] = owner
+    owner.array = array
+    refs = [weakref.ref(array), weakref.ref(owner)]
+    del owner, array
+    for _ in range(3):
+        gc.collect()
+    assert all(ref() is None for ref in refs)
+    assert not [value for value in gc.get_objects() if type(value) is Array]
+
+
+@pytest.mark.parametrize("signature", [False, True])
+def test_public_docstring_heap_type_lifetime(signature):
+    import gc
+    import weakref
+    from numpy._core._multiarray_tests import create_heap_array_gc_type
+
+    class Text(str):
+        pass
+
+    class Owner:
+        pass
+
+    for iteration in range(12):
+        target = create_heap_array_gc_type()
+        body = "Native heap documentation " + str(iteration)
+        prefix = target.__module__ + "." + target.__name__ + "(value=0)\n--\n\n"
+        text = Text(prefix + body if signature else body)
+        owner = Owner()
+        owner.target = target
+        text.owner = owner
+        refs = [weakref.ref(value) for value in (target, owner, text)]
+        np.lib.add_docstring(target, text)
+        assert target.__doc__ == body
+        del target, owner, text
+        for _ in range(3):
+            gc.collect()
+        assert all(reference() is None for reference in refs)
+
+
+def test_public_docstring_builtin_lifetime():
+    import gc
+    import weakref
+    from numpy._core._multiarray_tests import create_heap_array_gc_type
+
+    class Text(str):
+        pass
+
+    class Owner:
+        pass
+
+    text = Text("Public native heap-array factory documentation.")
+    owner = Owner()
+    owner.target = create_heap_array_gc_type
+    text.owner = owner
+    refs = [weakref.ref(text), weakref.ref(owner)]
+    np.lib.add_docstring(create_heap_array_gc_type, text)
+    assert create_heap_array_gc_type.__doc__ == text
+    del text, owner
+    for _ in range(3):
+        gc.collect()
+    assert all(reference() is None for reference in refs)

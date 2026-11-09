@@ -174,13 +174,85 @@ extern "C" {
     F(imag)
 
 #define NPY_MODULE_STATE_OBJECT_FIELDS(F) \
-    F(typeDict) \
+    F(typeDict)        \
+    F(bool_false)                     \
+    F(bool_true)                      \
     F(current_handler) \
+    F(default_mem_handler) \
     F(global_pytype_to_type_dict)
 
-/* One ownership list declares the structs and drives traverse/clear. */
+/*
+ * Heap types created with PyType_FromModuleAndSpec or PyType_FromMetaclass
+ * during module execution.  Each field owns its reference.
+ */
+#define NPY_MODULE_STATE_TYPE_FIELDS(F) \
+    F(_dtype_meta_type)               \
+    F(descr_type)                     \
+    F(string_dtype_type)              \
+    F(array_method_type)              \
+    F(bound_array_method_type)        \
+    F(ufunc_type)                     \
+    F(arrayiter_type)                 \
+    F(arraymultiiter_type)            \
+    F(neighborhood_iter_type)         \
+    F(mapiter_type)                   \
+    F(nditer_type)                    \
+    F(array_type)                     \
+    F(generic_scalar_type)            \
+    F(number_scalar_type)             \
+    F(integer_scalar_type)            \
+    F(signedinteger_scalar_type)      \
+    F(unsignedinteger_scalar_type)    \
+    F(inexact_scalar_type)            \
+    F(floating_scalar_type)           \
+    F(complexfloating_scalar_type)    \
+    F(flexible_scalar_type)           \
+    F(character_scalar_type)          \
+    F(void_scalar_type)               \
+    F(string_scalar_type)             \
+    F(unicode_scalar_type)            \
+    F(datetime_scalar_type)           \
+    F(timedelta_scalar_type)          \
+    F(byte_scalar_type)               \
+    F(short_scalar_type)              \
+    F(int_scalar_type)                \
+    F(long_scalar_type)               \
+    F(longlong_scalar_type)           \
+    F(ubyte_scalar_type)              \
+    F(ushort_scalar_type)             \
+    F(uint_scalar_type)               \
+    F(ulong_scalar_type)              \
+    F(ulonglong_scalar_type)          \
+    F(half_scalar_type)               \
+    F(float_scalar_type)              \
+    F(double_scalar_type)             \
+    F(longdouble_scalar_type)         \
+    F(cfloat_scalar_type)             \
+    F(cdouble_scalar_type)            \
+    F(clongdouble_scalar_type)        \
+    F(object_scalar_type)             \
+    F(bool_scalar_type)               \
+    F(integer_abstract_dtype)         \
+    F(float_abstract_dtype)           \
+    F(complex_abstract_dtype)         \
+    F(pylong_dtype)                   \
+    F(pyfloat_dtype)                  \
+    F(pycomplex_dtype)                \
+    F(PyArrayFlags_Type)              \
+    F(PyArrayArrayConverter_Type)     \
+    F(PyArrayFunctionDispatcher_Type) \
+    F(NpyBusDayCalendar_Type)
+
+/*
+ * Expand a field list into the PyObject * members it names, so the structs
+ * below are declared from the same list the traverse and clear functions use.
+ */
 #define NPY_DECLARE_ONE_PYOBJECT_FIELD(name) PyObject *name;
 #define NPY_DECLARE_PYOBJECT_FIELDS(list) list(NPY_DECLARE_ONE_PYOBJECT_FIELD)
+
+/* Types have the same ownership rules, with their actual C pointer type. */
+#define NPY_DECLARE_ONE_TYPE_FIELD(name) PyTypeObject *name;
+#define NPY_DECLARE_TYPE_FIELDS(list) list(NPY_DECLARE_ONE_TYPE_FIELD)
 
 #define NPY_FIELD_COUNT_ONE(name) + 1
 #define NPY_FIELD_COUNT(list) (0 list(NPY_FIELD_COUNT_ONE))

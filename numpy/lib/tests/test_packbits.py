@@ -4,6 +4,16 @@ import numpy as np
 from numpy.testing import assert_array_equal, assert_equal, assert_raises
 
 
+@pytest.mark.parametrize('length', (500, 501, 800, 2048))
+@pytest.mark.parametrize('bitorder', ('big', 'little'))
+def test_unpackbits_resolves_lookup_table_before_detach(length, bitorder):
+    payload = bytes((37 * index + 11) & 255 for index in range(length))
+    values = np.asarray(memoryview(payload), dtype=np.uint8)
+    shifts = range(7, -1, -1) if bitorder == 'big' else range(8)
+    expected = [(value >> shift) & 1 for value in payload for shift in shifts]
+    assert_array_equal(np.unpackbits(values, bitorder=bitorder), expected)
+
+
 def test_packbits():
     # Copied from the docstring.
     a = [[[1, 0, 1], [0, 1, 0]],

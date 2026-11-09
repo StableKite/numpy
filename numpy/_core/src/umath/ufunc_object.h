@@ -10,6 +10,9 @@ extern "C" {
 NPY_NO_EXPORT const char*
 ufunc_get_name_cstr(PyUFuncObject *ufunc);
 
+NPY_NO_EXPORT int
+init_ufunc_type(PyObject *module);
+
 NPY_NO_EXPORT PyObject *
 PyUFunc_GetDefaultIdentity(PyUFuncObject *ufunc, npy_bool *reorderable);
 
