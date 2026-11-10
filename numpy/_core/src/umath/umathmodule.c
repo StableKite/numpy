@@ -26,6 +26,7 @@
 #include "abstract.h"
 
 #include "numpy/npy_math.h"
+#include "exp2_fenv.h"
 #include "number.h"
 #include "dispatching.h"
 #include "string_ufuncs.h"

@@ -3,6 +3,7 @@
 #include <Python.h>
 
 #define NPY_NO_DEPRECATED_API NPY_API_VERSION
+#include "src/umath/_owned_test_context.h"
 #include "numpy/arrayobject.h"
 #include "numpy/arrayscalars.h"
 #include "numpy/npy_math.h"
@@ -2072,7 +2073,7 @@ PrintFloat_Printf_g(PyObject *obj, int precision)
  *  format_float_positional
  */
 static PyObject *
-printf_float_g(PyObject *NPY_UNUSED(dummy), PyObject *args, PyObject *kwds)
+printf_float_g(PyObject *NPY_UNUSED(dummy), PyObject *args)
 {
     PyObject *obj;
     int precision;
@@ -2437,135 +2438,985 @@ create_heap_array_gc_type(PyObject *module, PyObject *NPY_UNUSED(unused))
 }
 
 
+
+    static PyObject *
+owned_create_heap_array_gc_type(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = create_heap_array_gc_type(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_descr_clone_failure(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = descr_clone_failure(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_dtype_meta_clear_cycle(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = dtype_meta_clear_cycle(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_argparse_example_function(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = argparse_example_function(self, args, nargs, kwnames);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_threaded_argparse_example_function(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = threaded_argparse_example_function(self, args, nargs, kwnames);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_IsPythonScalar(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = IsPythonScalar(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_test_neighborhood_iterator(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = test_neighborhood_iterator(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_test_neighborhood_iterator_oob(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = test_neighborhood_iterator_oob(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_fromstring_null_term_c_api(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = fromstring_null_term_c_api(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_create_custom_field_dtype(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = create_custom_field_dtype(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_corrupt_or_fix_bufferinfo(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = corrupt_or_fix_bufferinfo(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_incref_elide(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = incref_elide(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_incref_elide_l(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = incref_elide_l(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_npy_char_deprecation(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = npy_char_deprecation(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_npy_create_writebackifcopy(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = npy_create_writebackifcopy(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_npy_abuse_writebackifcopy(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = npy_abuse_writebackifcopy(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_npy_resolve(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = npy_resolve(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_npy_discard(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = npy_discard(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_npy_ensurenocopy(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = npy_ensurenocopy(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_get_buffer_info(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = get_buffer_info(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_get_c_wrapping_array(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = get_c_wrapping_array(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_get_all_cast_information(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = get_all_cast_information(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_create_identity_hash(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = create_identity_hash(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_identity_hash_set_item_default(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = identity_hash_set_item_default(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_identity_hash_get_item(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = identity_hash_get_item(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_array_indexing(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = array_indexing(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_test_as_c_array(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = test_as_c_array(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_test_nditer_too_large(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = test_nditer_too_large(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_array_solve_diophantine(PyObject *self, PyObject *args, PyObject *kwds)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = array_solve_diophantine(self, args, kwds);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_array_internal_overlap(PyObject *self, PyObject *args, PyObject *kwds)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = array_internal_overlap(self, args, kwds);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_extint_safe_binop(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = extint_safe_binop(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_extint_to_128(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = extint_to_128(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_extint_to_64(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = extint_to_64(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_extint_mul_64_64(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = extint_mul_64_64(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_extint_add_128(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = extint_add_128(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_extint_sub_128(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = extint_sub_128(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_extint_neg_128(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = extint_neg_128(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_extint_shl_128(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = extint_shl_128(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_extint_shr_128(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = extint_shr_128(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_extint_gt_128(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = extint_gt_128(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_extint_divmod_128_64(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = extint_divmod_128_64(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_extint_floordiv_128_64(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = extint_floordiv_128_64(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_extint_ceildiv_128_64(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = extint_ceildiv_128_64(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_get_fpu_mode(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = get_fpu_mode(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+/**begin repeat
+ * #name = cabs, carg#
+ */
+
+/**begin repeat1
+ * #suffix = f, , l#
+ */
+    static PyObject *
+owned_call_npy_@name@@suffix@(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = call_npy_@name@@suffix@(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+/**end repeat1**/
+
+/**end repeat**/
+
+/**begin repeat
+ * #name = log10, cosh, sinh, tan, tanh#
+ */
+
+/**begin repeat1
+ * #suffix= f, , l#
+ */
+    static PyObject *
+owned_call_npy_@name@@suffix@(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = call_npy_@name@@suffix@(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+/**end repeat1**/
+
+/**end repeat**/
+    static PyObject *
+owned_printf_float_g(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = printf_float_g(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_get_struct_alignments(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = get_struct_alignments(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_run_byteorder_converter(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = run_byteorder_converter(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_run_sortkind_converter(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = run_sortkind_converter(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_run_selectkind_converter(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = run_selectkind_converter(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_run_searchside_converter(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = run_searchside_converter(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_run_order_converter(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = run_order_converter(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_run_clipmode_converter(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = run_clipmode_converter(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_run_casting_converter(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = run_casting_converter(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_run_scalar_intp_converter(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = run_scalar_intp_converter(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_run_scalar_intp_from_sequence(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = run_scalar_intp_from_sequence(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned_run_intp_converter(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = run_intp_converter(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+    static PyObject *
+owned__npy_import_entry_point(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = _npy_import_entry_point(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+
+
 static PyMethodDef Multiarray_TestsMethods[] = {
-    {"create_heap_array_gc_type", create_heap_array_gc_type, METH_NOARGS, NULL},
-    {"descr_clone_failure", descr_clone_failure, METH_O, NULL},
-    {"dtype_meta_clear_cycle", dtype_meta_clear_cycle, METH_NOARGS, NULL},
+    {"create_heap_array_gc_type", owned_create_heap_array_gc_type, METH_NOARGS, NULL},
+    {"descr_clone_failure", owned_descr_clone_failure, METH_O, NULL},
+    {"dtype_meta_clear_cycle", owned_dtype_meta_clear_cycle, METH_NOARGS, NULL},
     {"argparse_example_function",
-         (PyCFunction)argparse_example_function,
+         (PyCFunction)owned_argparse_example_function,
          METH_KEYWORDS | METH_FASTCALL, NULL},
     {"threaded_argparse_example_function",
-         (PyCFunction)threaded_argparse_example_function,
+         (PyCFunction)owned_threaded_argparse_example_function,
          METH_KEYWORDS | METH_FASTCALL, NULL},
     {"IsPythonScalar",
-        IsPythonScalar,
+        owned_IsPythonScalar,
         METH_VARARGS, NULL},
     {"test_neighborhood_iterator",
-        test_neighborhood_iterator,
+        owned_test_neighborhood_iterator,
         METH_VARARGS, NULL},
     {"test_neighborhood_iterator_oob",
-        test_neighborhood_iterator_oob,
+        owned_test_neighborhood_iterator_oob,
         METH_VARARGS, NULL},
     {"fromstring_null_term_c_api",
-        fromstring_null_term_c_api,
+        owned_fromstring_null_term_c_api,
         METH_O, NULL},
     {"create_custom_field_dtype",
-        create_custom_field_dtype,
+        owned_create_custom_field_dtype,
         METH_VARARGS, NULL},
     {"corrupt_or_fix_bufferinfo",
-        corrupt_or_fix_bufferinfo,
+        owned_corrupt_or_fix_bufferinfo,
         METH_O, NULL},
     {"incref_elide",
-        incref_elide,
+        owned_incref_elide,
         METH_VARARGS, NULL},
     {"incref_elide_l",
-        incref_elide_l,
+        owned_incref_elide_l,
         METH_VARARGS, NULL},
     {"npy_char_deprecation",
-        npy_char_deprecation,
+        owned_npy_char_deprecation,
         METH_NOARGS, NULL},
     {"npy_create_writebackifcopy",
-        npy_create_writebackifcopy,
+        owned_npy_create_writebackifcopy,
         METH_O, NULL},
     {"npy_abuse_writebackifcopy",
-        npy_abuse_writebackifcopy,
+        owned_npy_abuse_writebackifcopy,
         METH_O, NULL},
     {"npy_resolve",
-        npy_resolve,
+        owned_npy_resolve,
         METH_O, NULL},
     {"npy_discard",
-        npy_discard,
+        owned_npy_discard,
         METH_O, NULL},
     {"npy_ensurenocopy",
-        npy_ensurenocopy,
+        owned_npy_ensurenocopy,
         METH_O, NULL},
     {"get_buffer_info",
-        get_buffer_info,
+        owned_get_buffer_info,
         METH_VARARGS, NULL},
     {"get_c_wrapping_array",
-        get_c_wrapping_array,
+        owned_get_c_wrapping_array,
         METH_O, NULL},
     {"get_all_cast_information",
-        get_all_cast_information,
+        owned_get_all_cast_information,
         METH_NOARGS,
         "Return a list with info on all available casts. Some of the info "
         "may differ for an actual cast if it uses value-based casting "
         "(flexible types)."},
     {"create_identity_hash",
-        create_identity_hash,
+        owned_create_identity_hash,
         METH_VARARGS, "Create a new PyArrayIdentityHash wrapped in a PyCapsule."},
     {"identity_hash_set_item_default",
-        (PyCFunction)identity_hash_set_item_default,
+        (PyCFunction)owned_identity_hash_set_item_default,
         METH_VARARGS, "Set a default item in a PyArrayIdentityHash capsule."},
     {"identity_hash_get_item",
-        identity_hash_get_item,
+        owned_identity_hash_get_item,
         METH_VARARGS, "Get an item from a PyArrayIdentityHash capsule."},
     {"array_indexing",
-        array_indexing,
+        owned_array_indexing,
         METH_VARARGS, NULL},
     {"test_as_c_array",
-        test_as_c_array,
+        owned_test_as_c_array,
         METH_VARARGS, NULL},
     {"test_nditer_too_large",
-        test_nditer_too_large,
+        owned_test_nditer_too_large,
         METH_VARARGS, NULL},
     {"solve_diophantine",
-        (PyCFunction)array_solve_diophantine,
+        (PyCFunction)owned_array_solve_diophantine,
         METH_VARARGS | METH_KEYWORDS, NULL},
     {"internal_overlap",
-        (PyCFunction)array_internal_overlap,
+        (PyCFunction)owned_array_internal_overlap,
         METH_VARARGS | METH_KEYWORDS, NULL},
     {"extint_safe_binop",
-        extint_safe_binop,
+        owned_extint_safe_binop,
         METH_VARARGS, NULL},
     {"extint_to_128",
-        extint_to_128,
+        owned_extint_to_128,
         METH_VARARGS, NULL},
     {"extint_to_64",
-        extint_to_64,
+        owned_extint_to_64,
         METH_VARARGS, NULL},
     {"extint_mul_64_64",
-        extint_mul_64_64,
+        owned_extint_mul_64_64,
         METH_VARARGS, NULL},
     {"extint_add_128",
-        extint_add_128,
+        owned_extint_add_128,
         METH_VARARGS, NULL},
     {"extint_sub_128",
-        extint_sub_128,
+        owned_extint_sub_128,
         METH_VARARGS, NULL},
     {"extint_neg_128",
-        extint_neg_128,
+        owned_extint_neg_128,
         METH_VARARGS, NULL},
     {"extint_shl_128",
-        extint_shl_128,
+        owned_extint_shl_128,
         METH_VARARGS, NULL},
     {"extint_shr_128",
-        extint_shr_128,
+        owned_extint_shr_128,
         METH_VARARGS, NULL},
     {"extint_gt_128",
-        extint_gt_128,
+        owned_extint_gt_128,
         METH_VARARGS, NULL},
     {"extint_divmod_128_64",
-        extint_divmod_128_64,
+        owned_extint_divmod_128_64,
         METH_VARARGS, NULL},
     {"extint_floordiv_128_64",
-        extint_floordiv_128_64,
+        owned_extint_floordiv_128_64,
         METH_VARARGS, NULL},
     {"extint_ceildiv_128_64",
-        extint_ceildiv_128_64,
+        owned_extint_ceildiv_128_64,
         METH_VARARGS, NULL},
     {"get_fpu_mode",
-        get_fpu_mode,
+        owned_get_fpu_mode,
         METH_VARARGS, get_fpu_mode_doc},
 /**begin repeat
  * #name = cabs, carg#
@@ -2575,7 +3426,7 @@ static PyMethodDef Multiarray_TestsMethods[] = {
  * #suffix = f, , l#
  */
     {"npy_@name@@suffix@",
-        call_npy_@name@@suffix@,
+        owned_call_npy_@name@@suffix@,
         METH_VARARGS, NULL},
 /**end repeat1**/
 
@@ -2589,68 +3440,71 @@ static PyMethodDef Multiarray_TestsMethods[] = {
  * #suffix= f, , l#
  */
     {"npy_@name@@suffix@",
-        call_npy_@name@@suffix@,
+        owned_call_npy_@name@@suffix@,
         METH_VARARGS, NULL},
 /**end repeat1**/
 
 /**end repeat**/
     {"format_float_OSprintf_g",
-        (PyCFunction)printf_float_g,
+        (PyCFunction)owned_printf_float_g,
         METH_VARARGS , NULL},
     {"get_struct_alignments",
-        get_struct_alignments,
+        owned_get_struct_alignments,
         METH_VARARGS, NULL},
     {"run_byteorder_converter",
-        run_byteorder_converter,
+        owned_run_byteorder_converter,
         METH_VARARGS, NULL},
     {"run_sortkind_converter",
-        run_sortkind_converter,
+        owned_run_sortkind_converter,
         METH_VARARGS, NULL},
     {"run_selectkind_converter",
-        run_selectkind_converter,
+        owned_run_selectkind_converter,
         METH_VARARGS, NULL},
     {"run_searchside_converter",
-        run_searchside_converter,
+        owned_run_searchside_converter,
         METH_VARARGS, NULL},
     {"run_order_converter",
-        run_order_converter,
+        owned_run_order_converter,
         METH_VARARGS, NULL},
     {"run_clipmode_converter",
-        run_clipmode_converter,
+        owned_run_clipmode_converter,
         METH_VARARGS, NULL},
     {"run_casting_converter",
-        run_casting_converter,
+        owned_run_casting_converter,
         METH_VARARGS, NULL},
     {"run_scalar_intp_converter",
-        run_scalar_intp_converter,
+        owned_run_scalar_intp_converter,
         METH_O, NULL},
     {"run_scalar_intp_from_sequence",
-        run_scalar_intp_from_sequence,
+        owned_run_scalar_intp_from_sequence,
         METH_O, NULL},
     {"run_intp_converter",
-        run_intp_converter,
+        owned_run_intp_converter,
         METH_VARARGS, NULL},
     {"npy_import_entry_point",
-        _npy_import_entry_point,
+        owned__npy_import_entry_point,
         METH_O, NULL},
     {NULL, NULL, 0, NULL}        /* Sentinel */
 };
 
 
+#if PY_VERSION_HEX < 0x030f0000
 static int module_loaded = 0;
+#endif
 
 static int
 _multiarray_tests_exec(PyObject *m)
 {
-    // https://docs.python.org/3/howto/isolating-extensions.html#opt-out-limiting-to-one-module-object-per-process
+#if PY_VERSION_HEX < 0x030f0000
     if (module_loaded) {
         PyErr_SetString(PyExc_ImportError,
                         "cannot load module more than once per process");
         return -1;
     }
     module_loaded = 1;
+#endif
 
-    if (PyArray_ImportNumPyAPI() < 0) {
+    if (owned_test_initialize(m) < 0) {
         return -1;
     }
     if (init_argparse_mutex() < 0) {
@@ -2666,7 +3520,9 @@ _multiarray_tests_exec(PyObject *m)
 
 static struct PyModuleDef_Slot _multiarray_tests_slots[] = {
     {Py_mod_exec, _multiarray_tests_exec},
-#if PY_VERSION_HEX >= 0x030c00f0  // Python 3.12+
+#if PY_VERSION_HEX >= 0x030f0000
+    {Py_mod_multiple_interpreters, Py_MOD_PER_INTERPRETER_GIL_SUPPORTED},
+#elif PY_VERSION_HEX >= 0x030c00f0
     {Py_mod_multiple_interpreters, Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED},
 #endif
 #if PY_VERSION_HEX >= 0x030d00f0  // Python 3.13+
@@ -2679,9 +3535,12 @@ static struct PyModuleDef_Slot _multiarray_tests_slots[] = {
 static struct PyModuleDef moduledef = {
     .m_base = PyModuleDef_HEAD_INIT,
     .m_name = "_multiarray_tests",
-    .m_size = 0,
+    .m_size = sizeof(owned_test_state),
     .m_methods = Multiarray_TestsMethods,
     .m_slots = _multiarray_tests_slots,
+    .m_traverse = owned_test_traverse,
+    .m_clear = owned_test_clear,
+    .m_free = owned_test_free,
 };
 
 PyMODINIT_FUNC PyInit__multiarray_tests(void)

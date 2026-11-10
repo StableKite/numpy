@@ -7038,6 +7038,24 @@ init_ufunc_type(PyObject *module)
     if (state->ufunc_type == NULL) {
         return -1;
     }
+    /* Preserve 2.5.4's lazy signature descriptor on this interpreter's type.
+     * Publish while the fresh native type is still private to module exec. */
+    PyObject *globals = PyImport_ImportModule("numpy._globals");
+    if (globals == NULL) {
+        return -1;
+    }
+    PyObject *descriptor = PyObject_GetAttrString(globals, "_signature_descriptor");
+    Py_DECREF(globals);
+    if (descriptor == NULL) {
+        return -1;
+    }
+    int result = PyDict_SetItemString(state->ufunc_type->tp_dict,
+            "__signature__", descriptor);
+    Py_DECREF(descriptor);
+    if (result < 0) {
+        return -1;
+    }
+    PyType_Modified(state->ufunc_type);
     return 0;
 }
 

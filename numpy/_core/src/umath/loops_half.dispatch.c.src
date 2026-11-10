@@ -1,4 +1,5 @@
 #include "numpy/npy_math.h"
+#include "exp2_fenv.h"
 #include "simd/simd.h"
 #include "loops_utils.h"
 #include "loops.h"

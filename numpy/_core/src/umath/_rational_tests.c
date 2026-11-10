@@ -12,10 +12,26 @@
 #endif
 #define NPY_TARGET_VERSION NPY_2_0_API_VERSION
 
+#include "numpy/interpreter_context.h"
+typedef struct {
+    NPY_SI_Context numpy;
+    int runtime_version;
+    PyTypeObject *rational;
+    PyTypeObject *rational2;
+    PyTypeObject *dtype2;
+    PyObject *shared_owner;
+    int initialized;
+} rational_module_state;
+static _Thread_local rational_module_state *rational_active;
+#define NPY_API_MODULE_CONTEXT (&rational_active->numpy)
+#define NPY_API_MODULE_RUNTIME_VERSION (rational_active->runtime_version)
 #include "numpy/arrayobject.h"
 #include "numpy/ufuncobject.h"
 #include "numpy/dtype_api.h"
 #include "numpy/npy_3kcompat.h"
+#include "_owned_legacy_test_loop.h"
+
+static struct PyModuleDef moduledef;
 
 #define error_converting(x)  (((x) == -1) && PyErr_Occurred())
 
@@ -24,73 +40,73 @@
 
 /* Relevant arithmetic exceptions */
 
-/* Uncomment the following line to work around a bug in numpy */
-/* #define ACQUIRE_GIL */
-
+/* Legacy integer gcd/lcm loops may be detached. Their unchanged legacy
+ * selector captures the actual caller before detach, as for _umath_tests. */
 static void
-set_overflow(void) {
-#ifdef ACQUIRE_GIL
-    /* Need to grab the GIL to dodge a bug in numpy */
-    PyGILState_STATE state = PyGILState_Ensure();
-#endif
-    if (!PyErr_Occurred()) {
-        PyErr_SetString(PyExc_OverflowError,
-                "overflow in rational arithmetic");
+set_arithmetic_error(PyObject *exception, const char *message)
+{
+#if PY_VERSION_HEX >= 0x030d0000
+    PyThreadState *attached = PyThreadState_GetUnchecked();
+    if (attached == NULL) {
+        assert(owned_legacy_test_caller != NULL);
+        PyEval_RestoreThread(owned_legacy_test_caller);
     }
-#ifdef ACQUIRE_GIL
-    PyGILState_Release(state);
+    if (!PyErr_Occurred()) {
+        PyErr_SetString(exception, message);
+    }
+    if (attached == NULL) {
+        PyThreadState *caller = PyEval_SaveThread();
+        assert(caller == owned_legacy_test_caller);
+    }
+#else
+    /* Before 3.13 this module retains its main-interpreter-only contract.
+     * Numeric gcd/lcm loops may still release that interpreter's GIL. */
+    PyGILState_STATE saved = PyGILState_Ensure();
+    if (!PyErr_Occurred()) {
+        PyErr_SetString(exception, message);
+    }
+    PyGILState_Release(saved);
 #endif
 }
-
 static void
-set_zero_divide(void) {
-#ifdef ACQUIRE_GIL
-    /* Need to grab the GIL to dodge a bug in numpy */
-    PyGILState_STATE state = PyGILState_Ensure();
-#endif
-    if (!PyErr_Occurred()) {
-        PyErr_SetString(PyExc_ZeroDivisionError,
-                "zero divide in rational arithmetic");
-    }
-#ifdef ACQUIRE_GIL
-    PyGILState_Release(state);
-#endif
+set_overflow(void)
+{
+    set_arithmetic_error(PyExc_OverflowError, "overflow in rational arithmetic");
+}
+static void
+set_zero_divide(void)
+{
+    set_arithmetic_error(PyExc_ZeroDivisionError, "zero divide in rational arithmetic");
 }
 
 /* Integer arithmetic utilities */
 
 static inline npy_int32
-safe_neg(npy_int32 x) {
-    if (x==(npy_int32)1<<31) {
+safe_neg(npy_int32 x)
+{
+    if (x == NPY_MIN_INT32) {
         set_overflow();
+        return 0;
     }
     return -x;
 }
-
 static inline npy_int32
-safe_abs32(npy_int32 x) {
-    npy_int32 nx;
-    if (x>=0) {
-        return x;
-    }
-    nx = -x;
-    if (nx<0) {
+safe_abs32(npy_int32 x)
+{
+    if (x == NPY_MIN_INT32) {
         set_overflow();
+        return 0;
     }
-    return nx;
+    return x < 0 ? -x : x;
 }
-
 static inline npy_int64
-safe_abs64(npy_int64 x) {
-    npy_int64 nx;
-    if (x>=0) {
-        return x;
-    }
-    nx = -x;
-    if (nx<0) {
+safe_abs64(npy_int64 x)
+{
+    if (x == NPY_MIN_INT64) {
         set_overflow();
+        return 0;
     }
-    return nx;
+    return x < 0 ? -x : x;
 }
 
 static inline npy_int64
@@ -113,17 +129,22 @@ gcd(npy_int64 x, npy_int64 y) {
 }
 
 static inline npy_int64
-lcm(npy_int64 x, npy_int64 y) {
-    npy_int64 lcm;
+lcm(npy_int64 x, npy_int64 y)
+{
     if (!x || !y) {
         return 0;
     }
-    x /= gcd(x,y);
-    lcm = x*y;
-    if (lcm/y!=x) {
-        set_overflow();
+    x = safe_abs64(x);
+    y = safe_abs64(y);
+    if (!x || !y) {
+        return 0;  /* an absolute-value overflow already set the exception */
     }
-    return safe_abs64(lcm);
+    x /= gcd(x, y);
+    if (x > NPY_MAX_INT64 / y) {
+        set_overflow();
+        return 0;
+    }
+    return x * y;
 }
 
 /* Fixed precision rational numbers */
@@ -375,11 +396,74 @@ typedef struct {
     rational r;
 } PyRational;
 
-static PyTypeObject PyRational_Type;
+static PyObject *pyrational_new(PyTypeObject *, PyObject *, PyObject *);
+#define PyRational_Type (*rational_active->rational)
+#define PyRational2_Type (*rational_active->rational2)
+#define NPY_Rational2DType (*(PyArray_DTypeMeta *)rational_active->dtype2)
 
 static inline int
-PyRational_Check(PyObject* object) {
-    return PyObject_IsInstance(object,(PyObject*)&PyRational_Type);
+PyRational_Check(PyObject *object)
+{
+    /* A real C base, including Python subclasses; no foreign cached type. */
+    for (PyTypeObject *type = Py_TYPE(object); type != NULL; type = type->tp_base) {
+        if (type->tp_new == pyrational_new) {
+            return 1;
+        }
+    }
+    return 0;
+}
+static rational_module_state *
+rational_state_from_scalar(PyObject *object)
+{
+    for (PyTypeObject *type = Py_TYPE(object); type != NULL; type = type->tp_base) {
+        if (type->tp_new == pyrational_new) {
+            rational_module_state *state = PyType_GetModuleState(type);
+            if (state != NULL) {
+                return state;
+            }
+            PyErr_Clear();  /* an ordinary Python subclass has no C module */
+        }
+    }
+    PyErr_SetString(PyExc_TypeError, "rational scalar has no owning module");
+    return NULL;
+}
+static PyTypeObject *
+rational_result_type(PyObject *left, PyObject *right)
+{
+    PyObject *scalar = PyRational_Check(left) ? left : right;
+    rational_module_state *state = rational_state_from_scalar(scalar);
+    return state == NULL ? NULL : state->rational;
+}
+
+/* Registration is canonical within one interpreter, like the registered
+ * dtype itself. Reimports reuse its actual types/loops. The interpreter owns
+ * this cache and releases it at close; there is no process-wide PyObject. */
+static const char *rational_cache_key = "numpy._core._rational_tests.owned_v1";
+static PyObject *
+rational_cached_module(void)
+{
+    PyObject *dict = PyInterpreterState_GetDict(PyThreadState_GetInterpreter(PyThreadState_Get()));
+    if (dict == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "rational interpreter dictionary unavailable");
+        return NULL;
+    }
+    return PyDict_GetItemString(dict, rational_cache_key);  /* borrowed */
+}
+static rational_module_state *
+rational_registered_state(void)
+{
+    PyObject *module = rational_cached_module();
+    if (module == NULL) {
+        if (!PyErr_Occurred()) {
+            PyErr_SetString(PyExc_RuntimeError, "rational context is not initialized");
+        }
+        return NULL;
+    }
+    if (!PyModule_Check(module) || PyModule_GetDef(module) != &moduledef) {
+        PyErr_SetString(PyExc_RuntimeError, "invalid rational interpreter owner");
+        return NULL;
+    }
+    return PyModule_GetState(module);
 }
 
 static PyObject*
@@ -580,7 +664,8 @@ pyrational_hash(PyObject* self) {
         if (PyErr_Occurred()) { \
             return 0; \
         } \
-        return PyRational_FromRational(&PyRational_Type, z); \
+        PyTypeObject *type = rational_result_type(a, b); \
+        return type == NULL ? NULL : PyRational_FromRational(type, z); \
     }
 #define RATIONAL_BINOP(name) RATIONAL_BINOP_2(name,rational_##name(x,y))
 RATIONAL_BINOP(add)
@@ -609,7 +694,8 @@ RATIONAL_BINOP_2(floor_divide,
         if (PyErr_Occurred()) { \
             return 0; \
         } \
-        return PyRational_FromRational(&PyRational_Type, y); \
+        PyTypeObject *type = rational_result_type(self, self); \
+        return type == NULL ? NULL : PyRational_FromRational(type, y); \
     }
 RATIONAL_UNOP_RAT(negative,rational_negative(x))
 RATIONAL_UNOP_RAT(absolute,rational_abs(x))
@@ -628,45 +714,6 @@ pyrational_nonzero(PyObject* self) {
     return rational_nonzero(x);
 }
 
-static PyNumberMethods pyrational_as_number = {
-    pyrational_add,          /* nb_add */
-    pyrational_subtract,     /* nb_subtract */
-    pyrational_multiply,     /* nb_multiply */
-    pyrational_remainder,    /* nb_remainder */
-    0,                       /* nb_divmod */
-    0,                       /* nb_power */
-    pyrational_negative,     /* nb_negative */
-    pyrational_positive,     /* nb_positive */
-    pyrational_absolute,     /* nb_absolute */
-    pyrational_nonzero,      /* nb_nonzero */
-    0,                       /* nb_invert */
-    0,                       /* nb_lshift */
-    0,                       /* nb_rshift */
-    0,                       /* nb_and */
-    0,                       /* nb_xor */
-    0,                       /* nb_or */
-    pyrational_int,          /* nb_int */
-    0,                       /* reserved */
-    pyrational_float,        /* nb_float */
-
-    0,                       /* nb_inplace_add */
-    0,                       /* nb_inplace_subtract */
-    0,                       /* nb_inplace_multiply */
-    0,                       /* nb_inplace_remainder */
-    0,                       /* nb_inplace_power */
-    0,                       /* nb_inplace_lshift */
-    0,                       /* nb_inplace_rshift */
-    0,                       /* nb_inplace_and */
-    0,                       /* nb_inplace_xor */
-    0,                       /* nb_inplace_or */
-
-    pyrational_floor_divide, /* nb_floor_divide */
-    pyrational_divide,       /* nb_true_divide */
-    0,                       /* nb_inplace_floor_divide */
-    0,                       /* nb_inplace_true_divide */
-    0,                       /* nb_index */
-};
-
 static PyObject*
 pyrational_n(PyObject* self, void* closure) {
     return PyLong_FromLong(((PyRational*)self)->r.n);
@@ -683,55 +730,64 @@ static PyGetSetDef pyrational_getset[] = {
     {0} /* sentinel */
 };
 
-static PyTypeObject PyRational_Type = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    "numpy._core._rational_tests.rational",   /* tp_name */
-    sizeof(PyRational),                       /* tp_basicsize */
-    0,                                        /* tp_itemsize */
-    0,                                        /* tp_dealloc */
-    0,                                        /* tp_print */
-    0,                                        /* tp_getattr */
-    0,                                        /* tp_setattr */
-    0,                                        /* tp_reserved */
-    pyrational_repr,                          /* tp_repr */
-    &pyrational_as_number,                    /* tp_as_number */
-    0,                                        /* tp_as_sequence */
-    0,                                        /* tp_as_mapping */
-    pyrational_hash,                          /* tp_hash */
-    0,                                        /* tp_call */
-    pyrational_str,                           /* tp_str */
-    0,                                        /* tp_getattro */
-    0,                                        /* tp_setattro */
-    0,                                        /* tp_as_buffer */
-    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE, /* tp_flags */
-    "Fixed precision rational numbers",       /* tp_doc */
-    0,                                        /* tp_traverse */
-    0,                                        /* tp_clear */
-    pyrational_richcompare,                   /* tp_richcompare */
-    0,                                        /* tp_weaklistoffset */
-    0,                                        /* tp_iter */
-    0,                                        /* tp_iternext */
-    0,                                        /* tp_methods */
-    0,                                        /* tp_members */
-    pyrational_getset,                        /* tp_getset */
-    0,                                        /* tp_base */
-    0,                                        /* tp_dict */
-    0,                                        /* tp_descr_get */
-    0,                                        /* tp_descr_set */
-    0,                                        /* tp_dictoffset */
-    0,                                        /* tp_init */
-    0,                                        /* tp_alloc */
-    pyrational_new,                           /* tp_new */
-    0,                                        /* tp_free */
-    0,                                        /* tp_is_gc */
-    0,                                        /* tp_bases */
-    0,                                        /* tp_mro */
-    0,                                        /* tp_cache */
-    0,                                        /* tp_subclasses */
-    0,                                        /* tp_weaklist */
-    0,                                        /* tp_del */
-    0,                                        /* tp_version_tag */
-};
+static int
+rational_scalar_traverse(PyObject *self, visitproc visit, void *arg)
+{
+    Py_VISIT(Py_TYPE(self));
+    return 0;
+}
+static void
+rational_scalar_dealloc(PyObject *self)
+{
+    PyTypeObject *type = Py_TYPE(self);
+    PyObject_GC_UnTrack(self);
+    type->tp_free(self);
+    Py_DECREF(type);
+}
+static PyTypeObject *
+create_rational_scalar(PyObject *module, PyTypeObject *base, int second)
+{
+    PyType_Slot slots[] = {
+        {Py_tp_dealloc, rational_scalar_dealloc},
+        {Py_tp_alloc, PyType_GenericAlloc},
+        {Py_tp_free, PyObject_GC_Del},
+        {Py_tp_traverse, rational_scalar_traverse},
+        {Py_tp_doc, "Fixed precision rational numbers"},
+        {Py_tp_new, pyrational_new},
+        {Py_tp_repr, pyrational_repr},
+        {Py_tp_str, pyrational_str},
+        {Py_tp_hash, pyrational_hash},
+        {Py_tp_richcompare, pyrational_richcompare},
+        {Py_tp_getset, pyrational_getset},
+        {Py_nb_add, pyrational_add},
+        {Py_nb_subtract, pyrational_subtract},
+        {Py_nb_multiply, pyrational_multiply},
+        {Py_nb_remainder, pyrational_remainder},
+        {Py_nb_negative, pyrational_negative},
+        {Py_nb_positive, pyrational_positive},
+        {Py_nb_absolute, pyrational_absolute},
+        {Py_nb_bool, pyrational_nonzero},
+        {Py_nb_int, pyrational_int},
+        {Py_nb_float, pyrational_float},
+        {Py_nb_floor_divide, pyrational_floor_divide},
+        {Py_nb_true_divide, pyrational_divide},
+        {0, NULL}
+    };
+    PyType_Spec spec = {
+        .name = second ? "numpy._core._rational_tests.rational2"
+                       : "numpy._core._rational_tests.rational",
+        .basicsize = sizeof(PyRational),
+        .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC,
+        .slots = slots,
+    };
+    PyObject *bases = PyTuple_Pack(1, (PyObject *)base);
+    if (bases == NULL) {
+        return NULL;
+    }
+    PyObject *type = PyType_FromModuleAndSpec(module, &spec, bases);
+    Py_DECREF(bases);
+    return (PyTypeObject *)type;
+}
 
 /* NumPy support */
 
@@ -739,7 +795,8 @@ static PyObject*
 npyrational_getitem(void* data, void* arr) {
     rational r;
     memcpy(&r,data,sizeof(rational));
-    return PyRational_FromRational(&PyRational_Type, r);
+    rational_module_state *state = rational_registered_state();
+    return state == NULL ? NULL : PyRational_FromRational(state->rational, r);
 }
 
 static int
@@ -906,31 +963,7 @@ npyrational_fillwithscalar(void* buffer_, npy_intp length,
     return 0;
 }
 
-static PyArray_ArrFuncs npyrational_arrfuncs;
-
 typedef struct { char c; rational r; } align_test;
-
-PyArray_DescrProto npyrational_descr_proto = {
-    PyObject_HEAD_INIT(0)
-    &PyRational_Type,       /* typeobj */
-    'V',                    /* kind */
-    'r',                    /* type */
-    '=',                    /* byteorder */
-    /*
-     * For now, we need NPY_NEEDS_PYAPI in order to make numpy detect our
-     * exceptions.  This isn't technically necessary,
-     * since we're careful about thread safety, and hopefully future
-     * versions of numpy will recognize that.
-     */
-    NPY_NEEDS_PYAPI | NPY_USE_GETITEM | NPY_USE_SETITEM, /* hasobject */
-    0,                      /* type_num */
-    sizeof(rational),       /* elsize */
-    offsetof(align_test,r), /* alignment */
-    0,                      /* subarray */
-    0,                      /* fields */
-    0,                      /* names */
-    &npyrational_arrfuncs,  /* f */
-};
 
 /*
  * A second rational variant registered via `PyArrayInitDTypeMeta_FromSpec`
@@ -938,26 +971,37 @@ PyArray_DescrProto npyrational_descr_proto = {
  * (Python subclass of `PyRational_Type`), so all the existing C helpers,
  * casts, and ufunc loops can be reused for the new typenum/descr.
  */
-static PyTypeObject PyRational2_Type = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    "numpy._core._rational_tests.rational2",
-    sizeof(PyRational),
-    /* the rest is inherited from PyRational_Type via tp_base */
-};
-
-
 static PyObject *
-rational2_repr(PyObject *self) {
-    // Just forward, but old versions of NumPy require a repr
-    // although for "legacy" dtypes the default one works.
-    return PyArrayDescr_Type.tp_repr(self);
+rational2_repr(PyObject *self)
+{
+    rational_module_state *state = PyType_GetModuleState(Py_TYPE(self));
+    if (state == NULL) {
+        return NULL;
+    }
+    rational_module_state *previous = rational_active;
+    rational_active = state;
+    PyObject *result = PyArrayDescr_Type.tp_repr(self);
+    rational_active = previous;
+    return result;
 }
-
-static PyArray_DTypeMeta NPY_Rational2DType = {{{
-    PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "numpy._core._rational_tests.Rational2DType",
-    .tp_repr = (reprfunc)rational2_repr,
-}}};
+static PyArray_DTypeMeta *
+create_rational_dtype(PyObject *module)
+{
+    PyType_Slot slots[] = {{Py_tp_repr, rational2_repr}, {0, NULL}};
+    PyType_Spec spec = {
+        .name = "numpy._core._rational_tests.Rational2DType",
+        .basicsize = sizeof(_PyArray_LegacyDescr),
+        .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_IMMUTABLETYPE,
+        .slots = slots,
+    };
+    PyObject *bases = PyTuple_Pack(1, (PyObject *)&PyArrayDescr_Type);
+    if (bases == NULL) {
+        return NULL;
+    }
+    PyObject *type = PyType_FromMetaclass(&PyArrayDTypeMeta_Type, module, &spec, bases);
+    Py_DECREF(bases);
+    return (PyArray_DTypeMeta *)type;
+}
 
 /*
  * Within-DType identity cast (memcpy).  Required by
@@ -1219,31 +1263,34 @@ register_rational_casts_and_ufuncs(int typenum,
                                    PyObject *numpy)
 {
     #define REGISTER_CAST(From,To,from_descr,to_typenum,safe) { \
-            PyArray_Descr* from_descr_##From##_##To = (from_descr); \
-            if (PyArray_RegisterCastFunc(from_descr_##From##_##To, \
-                                         (to_typenum), \
-                                         npycast_##From##_##To) < 0) { \
+            PyArray_Descr *owned_descr = (PyArray_Descr *)(from_descr); \
+            if (owned_descr == NULL) { \
                 return -1; \
             } \
-            if (safe && PyArray_RegisterCanCast(from_descr_##From##_##To, \
-                                                (to_typenum), \
-                                                NPY_NOSCALAR) < 0) { \
+            int result = PyArray_RegisterCastFunc(owned_descr, \
+                    (to_typenum), npycast_##From##_##To); \
+            if (result == 0 && safe) { \
+                result = PyArray_RegisterCanCast(owned_descr, \
+                        (to_typenum), NPY_NOSCALAR); \
+            } \
+            Py_DECREF(owned_descr); \
+            if (result < 0) { \
                 return -1; \
             } \
         }
     #define REGISTER_INT_CASTS(bits) \
         REGISTER_CAST(npy_int##bits, rational, \
                       PyArray_DescrFromType(NPY_INT##bits), typenum, 1) \
-        REGISTER_CAST(rational, npy_int##bits, descr, NPY_INT##bits, 0)
+        REGISTER_CAST(rational, npy_int##bits, (PyArray_Descr *)Py_NewRef(descr), NPY_INT##bits, 0)
     REGISTER_INT_CASTS(8)
     REGISTER_INT_CASTS(16)
     REGISTER_INT_CASTS(32)
     REGISTER_INT_CASTS(64)
-    REGISTER_CAST(rational, float, descr, NPY_FLOAT, 0)
-    REGISTER_CAST(rational, double, descr, NPY_DOUBLE, 1)
+    REGISTER_CAST(rational, float, (PyArray_Descr *)Py_NewRef(descr), NPY_FLOAT, 0)
+    REGISTER_CAST(rational, double, (PyArray_Descr *)Py_NewRef(descr), NPY_DOUBLE, 1)
     REGISTER_CAST(npy_bool, rational,
                   PyArray_DescrFromType(NPY_BOOL), typenum, 1)
-    REGISTER_CAST(rational, npy_bool, descr, NPY_BOOL, 0)
+    REGISTER_CAST(rational, npy_bool, (PyArray_Descr *)Py_NewRef(descr), NPY_BOOL, 0)
     #undef REGISTER_CAST
     #undef REGISTER_INT_CASTS
 
@@ -1315,51 +1362,54 @@ static PyMethodDef module_methods[] = {
     {0} /* sentinel */
 };
 
-static struct PyModuleDef moduledef = {
-    PyModuleDef_HEAD_INIT,
-    "_rational_tests",
-    NULL,
-    -1,
-    module_methods,
-    NULL,
-    NULL,
-    NULL,
-    NULL
+static int
+rational_add_owned(PyObject *module, const char *name, PyObject *value)
+{
+    if (PyModule_AddObject(module, name, value) < 0) {
+        Py_DECREF(value);
+        return -1;
+    }
+    return 0;
+}
+
+static int
+initialize_rational_tests(PyObject *m)
+{
+    PyObject *numpy = NULL;
+    int npy_rational, npy_rational2;
+    PyArray_Descr *npyrational_descr = NULL;
+    PyArray_Descr *npyrational2_descr = NULL;
+    PyArray_ArrFuncs npyrational_arrfuncs;
+    numpy = PyImport_ImportModule("numpy");
+    if (numpy == NULL) {
+        goto fail;
+    }
+    rational_active->rational = create_rational_scalar(m, &PyGenericArrType_Type, 0);
+    if (rational_active->rational == NULL) {
+        goto fail;
+    }
+    PyArray_DescrProto npyrational_descr_proto = {
+    PyObject_HEAD_INIT(0)
+    &PyRational_Type,       /* typeobj */
+    'V',                    /* kind */
+    'r',                    /* type */
+    '=',                    /* byteorder */
+    /*
+     * For now, we need NPY_NEEDS_PYAPI in order to make numpy detect our
+     * exceptions.  This isn't technically necessary,
+     * since we're careful about thread safety, and hopefully future
+     * versions of numpy will recognize that.
+     */
+    NPY_NEEDS_PYAPI | NPY_USE_GETITEM | NPY_USE_SETITEM, /* hasobject */
+    0,                      /* type_num */
+    sizeof(rational),       /* elsize */
+    offsetof(align_test,r), /* alignment */
+    0,                      /* subarray */
+    0,                      /* fields */
+    0,                      /* names */
+    &npyrational_arrfuncs,  /* f */
 };
 
-PyMODINIT_FUNC PyInit__rational_tests(void) {
-    PyObject *m = NULL;
-    PyObject* numpy_str;
-    PyObject* numpy;
-    int npy_rational;
-    int npy_rational2;
-    PyArray_Descr *npyrational2_descr = NULL;
-
-    import_array();
-    if (PyErr_Occurred()) {
-        goto fail;
-    }
-    import_umath();
-    if (PyErr_Occurred()) {
-        goto fail;
-    }
-    numpy_str = PyUnicode_FromString("numpy");
-    if (!numpy_str) {
-        goto fail;
-    }
-    numpy = PyImport_Import(numpy_str);
-    Py_DECREF(numpy_str);
-    if (!numpy) {
-        goto fail;
-    }
-
-    /* Can't set this until we import numpy */
-    PyRational_Type.tp_base = &PyGenericArrType_Type;
-
-    /* Initialize rational type object */
-    if (PyType_Ready(&PyRational_Type) < 0) {
-        goto fail;
-    }
 
     /* Initialize rational descriptor */
     PyArray_InitArrFuncs(&npyrational_arrfuncs);
@@ -1380,7 +1430,10 @@ PyMODINIT_FUNC PyInit__rational_tests(void) {
     if (npy_rational<0) {
         goto fail;
     }
-    PyArray_Descr *npyrational_descr = PyArray_DescrFromType(npy_rational);
+    npyrational_descr = PyArray_DescrFromType(npy_rational);
+    if (npyrational_descr == NULL) {
+        goto fail;
+    }
 
     /* Support dtype(rational) syntax */
     if (PyDict_SetItemString(PyRational_Type.tp_dict, "dtype",
@@ -1403,9 +1456,12 @@ PyMODINIT_FUNC PyInit__rational_tests(void) {
      * NOTE(seberg): Once parts of the legacy API are deprecated (e.g.
      * adding casts) we can clean this up to only use the rational2 path.
      */
-    PyRational2_Type.tp_base = &PyRational_Type;
-    PyRational2_Type.tp_basicsize = sizeof(PyRational);
-    if (PyType_Ready(&PyRational2_Type) < 0) {
+    rational_active->rational2 = create_rational_scalar(m, &PyRational_Type, 1);
+    if (rational_active->rational2 == NULL) {
+        goto fail;
+    }
+    rational_active->dtype2 = (PyTypeObject *)create_rational_dtype(m);
+    if (rational_active->dtype2 == NULL) {
         goto fail;
     }
 
@@ -1424,13 +1480,13 @@ PyMODINIT_FUNC PyInit__rational_tests(void) {
 
         /* Within-DType identity cast (NULL `dtypes` slots are filled in
          * by `PyArrayInitDTypeMeta_FromSpec`). */
-        static PyType_Slot within_dtype_slots[] = {
+        PyType_Slot within_dtype_slots[] = {
             {NPY_METH_strided_loop, rational2_within_dtype_loop},
             {NPY_METH_unaligned_strided_loop, rational2_within_dtype_loop},
             {0, NULL},
         };
-        static PyArray_DTypeMeta *within_dtype_dtypes[2] = {NULL, NULL};
-        static PyArrayMethod_Spec within_dtype_cast = {
+        PyArray_DTypeMeta *within_dtype_dtypes[2] = {NULL, NULL};
+        PyArrayMethod_Spec within_dtype_cast = {
             .name = "cast_rational2_within_dtype",
             .nin = 1,
             .nout = 1,
@@ -1439,7 +1495,7 @@ PyMODINIT_FUNC PyInit__rational_tests(void) {
             .dtypes = within_dtype_dtypes,
             .slots = within_dtype_slots,
         };
-        static PyArrayMethod_Spec *casts[] = {&within_dtype_cast, NULL};
+        PyArrayMethod_Spec *casts[] = {&within_dtype_cast, NULL};
 
         PyArrayDTypeMeta_Spec dtype_spec = {
             .typeobj = &PyRational2_Type,
@@ -1449,11 +1505,6 @@ PyMODINIT_FUNC PyInit__rational_tests(void) {
             .baseclass = NULL,
         };
 
-        Py_SET_TYPE(&NPY_Rational2DType, &PyArrayDTypeMeta_Type);
-        ((PyTypeObject *)&NPY_Rational2DType)->tp_base = &PyArrayDescr_Type;
-        if (PyType_Ready((PyTypeObject *)&NPY_Rational2DType) < 0) {
-            goto fail;
-        }
         if (PyArrayInitDTypeMeta_FromSpec(
                 &NPY_Rational2DType, &dtype_spec) < 0) {
             goto fail;
@@ -1474,22 +1525,18 @@ PyMODINIT_FUNC PyInit__rational_tests(void) {
         goto fail;
     }
 
-    /* Create module */
-    m = PyModule_Create(&moduledef);
-
-    if (!m) {
+    PyType_Modified(&PyRational_Type);
+    PyType_Modified(&PyRational2_Type);
+#if PY_VERSION_HEX >= 0x030e0000
+    if (PyType_Freeze(&PyRational_Type) < 0 || PyType_Freeze(&PyRational2_Type) < 0) {
         goto fail;
     }
-
-    /* Add rational type */
-    Py_INCREF(&PyRational_Type);
-    PyModule_AddObject(m,"rational",(PyObject*)&PyRational_Type);
-
-    /* Add the new-API rational variant (subclass of `rational`) */
-    Py_INCREF(&PyRational2_Type);
-    PyModule_AddObject(m, "rational2", (PyObject *)&PyRational2_Type);
-    Py_INCREF((PyObject *)&NPY_Rational2DType);
-    PyModule_AddObject(m, "Rational2DType", (PyObject *)&NPY_Rational2DType);
+#endif
+    if (PyModule_AddObjectRef(m, "rational", (PyObject *)&PyRational_Type) < 0
+            || PyModule_AddObjectRef(m, "rational2", (PyObject *)&PyRational2_Type) < 0
+            || PyModule_AddObjectRef(m, "Rational2DType", (PyObject *)&NPY_Rational2DType) < 0) {
+        goto fail;
+    }
 
     /* Create matrix multiply generalized ufunc */
     {
@@ -1503,9 +1550,12 @@ PyMODINIT_FUNC PyInit__rational_tests(void) {
         }
         if (PyUFunc_RegisterLoopForType((PyUFuncObject*)gufunc, npy_rational,
                 rational_gufunc_matrix_multiply, types2, 0) < 0) {
+            Py_DECREF(gufunc);
             goto fail;
         }
-        PyModule_AddObject(m,"matrix_multiply",(PyObject*)gufunc);
+        if (rational_add_owned(m,"matrix_multiply",(PyObject*)gufunc) < 0) {
+            goto fail;
+        }
     }
 
     /* Create test ufunc with built in input types and rational output type */
@@ -1520,9 +1570,12 @@ PyMODINIT_FUNC PyInit__rational_tests(void) {
         }
         if (PyUFunc_RegisterLoopForType((PyUFuncObject*)ufunc, npy_rational,
                 rational_ufunc_test_add, types3, 0) < 0) {
+            Py_DECREF(ufunc);
             goto fail;
         }
-        PyModule_AddObject(m,"test_add",(PyObject*)ufunc);
+        if (rational_add_owned(m,"test_add",(PyObject*)ufunc) < 0) {
+            goto fail;
+        }
     }
 
     /* Create test ufunc with rational types using RegisterLoopForDescr */
@@ -1539,9 +1592,12 @@ PyMODINIT_FUNC PyInit__rational_tests(void) {
         }
         if (PyUFunc_RegisterLoopForDescr((PyUFuncObject*)ufunc, npyrational_descr,
                 rational_ufunc_test_add_rationals, types, 0) < 0) {
+            Py_DECREF(ufunc);
             goto fail;
         }
-        PyModule_AddObject(m,"test_add_rationals",(PyObject*)ufunc);
+        if (rational_add_owned(m,"test_add_rationals",(PyObject*)ufunc) < 0) {
+            goto fail;
+        }
     }
 
     /* Create numerator and denominator ufuncs */
@@ -1554,9 +1610,12 @@ PyMODINIT_FUNC PyInit__rational_tests(void) {
         } \
         if (PyUFunc_RegisterLoopForType((PyUFuncObject*)ufunc, \
                 npy_rational,rational_ufunc_##name,types,0)<0) { \
+            Py_DECREF(ufunc); \
             goto fail; \
         } \
-        PyModule_AddObject(m,#name,(PyObject*)ufunc); \
+        if (rational_add_owned(m,#name,(PyObject*)ufunc) < 0) { \
+            goto fail; \
+        } \
     }
     NEW_UNARY_UFUNC(numerator,NPY_INT64,"rational number numerator");
     NEW_UNARY_UFUNC(denominator,NPY_INT64,"rational number denominator");
@@ -1572,26 +1631,133 @@ PyMODINIT_FUNC PyInit__rational_tests(void) {
         if (!ufunc) { \
             goto fail; \
         } \
-        PyModule_AddObject(m,#name,(PyObject*)ufunc); \
+        if (owned_legacy_test_install((PyUFuncObject *)ufunc) < 0) { \
+            Py_DECREF(ufunc); \
+            goto fail; \
+        } \
+        if (rational_add_owned(m,#name,(PyObject*)ufunc) < 0) { \
+            goto fail; \
+        } \
     }
     GCD_LCM_UFUNC(gcd,NPY_INT64,"greatest common denominator of two integers");
     GCD_LCM_UFUNC(lcm,NPY_INT64,"least common multiple of two integers");
 
-#ifdef Py_GIL_DISABLED
-    // signal this module supports running with the GIL disabled
-    PyUnstable_Module_SetGIL(m, Py_MOD_GIL_NOT_USED);
-#endif
-
-    return m;
+    Py_DECREF(numpy);
+    Py_DECREF(npyrational_descr);
+    Py_DECREF(npyrational2_descr);
+    return 0;
 
 fail:
+    Py_XDECREF(numpy);
+    Py_XDECREF(npyrational_descr);
+    Py_XDECREF(npyrational2_descr);
     if (!PyErr_Occurred()) {
-        PyErr_SetString(PyExc_RuntimeError,
-                        "cannot load _rational_tests module.");
+        PyErr_SetString(PyExc_RuntimeError, "cannot load _rational_tests module");
     }
-    if (m) {
-        Py_DECREF(m);
-        m = NULL;
+    return -1;
+}
+
+static int
+rational_module_traverse(PyObject *module, visitproc visit, void *arg)
+{
+    rational_module_state *state = PyModule_GetState(module);
+    if (state == NULL) {
+        return 0;
     }
-    return m;
+    Py_VISIT(state->rational);
+    Py_VISIT(state->rational2);
+    Py_VISIT(state->dtype2);
+    Py_VISIT(state->shared_owner);
+    return NPY_SI_Context_Traverse(&state->numpy, visit, arg);
+}
+static int
+rational_module_clear(PyObject *module)
+{
+    rational_module_state *state = PyModule_GetState(module);
+    if (state == NULL) {
+        return 0;
+    }
+    Py_CLEAR(state->shared_owner);
+    Py_CLEAR(state->rational);
+    Py_CLEAR(state->rational2);
+    Py_CLEAR(state->dtype2);
+    NPY_SI_Context_Clear(&state->numpy);
+    return 0;
+}
+static void
+rational_module_free(void *module)
+{
+    rational_module_clear((PyObject *)module);
+}
+static int
+rational_module_exec(PyObject *module)
+{
+    rational_module_state *state = PyModule_GetState(module);
+    if (state->initialized) {
+        return 0;
+    }
+    PyObject *canonical = rational_cached_module();
+    if (canonical != NULL && canonical != module) {
+        const char *names[] = {"rational", "rational2", "Rational2DType",
+            "matrix_multiply", "test_add", "test_add_rationals", "numerator",
+            "denominator", "gcd", "lcm", NULL};
+        for (int i = 0; names[i] != NULL; i++) {
+            PyObject *value = PyObject_GetAttrString(canonical, names[i]);
+            if (value == NULL) {
+                return -1;
+            }
+            int result = PyModule_AddObjectRef(module, names[i], value);
+            Py_DECREF(value);
+            if (result < 0) {
+                return -1;
+            }
+        }
+        state->shared_owner = Py_NewRef(canonical);
+        state->initialized = 1;
+        return 0;
+    }
+    if (PyErr_Occurred() || NPY_SI_Context_Import(&state->numpy) < 0) {
+        return -1;
+    }
+    typedef unsigned int (*feature_version_func)(void);
+    state->runtime_version = (int)((feature_version_func)state->numpy.array_api[211])();
+    rational_module_state *previous = rational_active;
+    rational_active = state;
+    int result = initialize_rational_tests(module);
+    rational_active = previous;
+    if (result < 0) {
+        return -1;
+    }
+    PyObject *dict = PyInterpreterState_GetDict(PyThreadState_GetInterpreter(PyThreadState_Get()));
+    if (dict == NULL || PyDict_SetItemString(dict, rational_cache_key, module) < 0) {
+        return -1;
+    }
+    state->initialized = 1;
+    return 0;
+}
+static PyModuleDef_Slot rational_slots[] = {
+    {Py_mod_exec, rational_module_exec},
+#if PY_VERSION_HEX >= 0x030f0000
+    {Py_mod_multiple_interpreters, Py_MOD_PER_INTERPRETER_GIL_SUPPORTED},
+#elif PY_VERSION_HEX >= 0x030c0000
+    {Py_mod_multiple_interpreters, Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED},
+#endif
+#if PY_VERSION_HEX >= 0x030d0000
+    {Py_mod_gil, Py_MOD_GIL_NOT_USED},
+#endif
+    {0, NULL}
+};
+static struct PyModuleDef moduledef = {
+    .m_base = PyModuleDef_HEAD_INIT,
+    .m_name = "_rational_tests",
+    .m_size = sizeof(rational_module_state),
+    .m_methods = module_methods,
+    .m_slots = rational_slots,
+    .m_traverse = rational_module_traverse,
+    .m_clear = rational_module_clear,
+    .m_free = rational_module_free
+};
+PyMODINIT_FUNC PyInit__rational_tests(void)
+{
+    return PyModuleDef_Init(&moduledef);
 }

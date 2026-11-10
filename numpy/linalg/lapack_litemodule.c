@@ -7,6 +7,20 @@ More modifications by Jeff Whitaker
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+#include "numpy/npy_common.h"
+#include "numpy/interpreter_context.h"
+#include "lapack_lite/python_xerbla.h"
+
+typedef struct {
+    NPY_SI_Context numpy;
+    PyObject *error;
+    int runtime_version;
+} lapack_lite_state;
+
+/* Borrowed only for one wrapper call; nested callbacks restore the old state. */
+static _Thread_local lapack_lite_state *lapack_lite_active;
+#define NPY_API_MODULE_CONTEXT (&lapack_lite_active->numpy)
+#define NPY_API_MODULE_RUNTIME_VERSION (lapack_lite_active->runtime_version)
 #include "numpy/arrayobject.h"
 #include "npy_cblas.h"
 
@@ -68,7 +82,19 @@ extern fortran_int FNAME(zungqr)(fortran_int *m, fortran_int *n, fortran_int *k,
 
 extern fortran_int FNAME(xerbla)(char *srname, fortran_int *info);
 
-static PyObject *LapackError;
+#define LapackError (lapack_lite_active->error)
+
+/* Bundled f2c has shared numeric scratch storage. Only the pure Fortran call
+ * is locked: argument conversion may invoke Python and reenter this module. */
+#if PY_VERSION_HEX >= 0x030d00b3
+static PyMutex lapack_lite_call_lock = {0};
+#define LOCK_LAPACK_LITE PyMutex_Lock(&lapack_lite_call_lock)
+#define UNLOCK_LAPACK_LITE PyMutex_Unlock(&lapack_lite_call_lock)
+#else
+/* Older supported builds retain their GIL and the original call contract. */
+#define LOCK_LAPACK_LITE
+#define UNLOCK_LAPACK_LITE
+#endif
 
 #define TRY(E) if (!(E)) return NULL
 
@@ -149,10 +175,12 @@ lapack_lite_dgelsd(PyObject *NPY_UNUSED(self), PyObject *args)
     TRY(check_object(iwork,NPY_INT64,"iwork","NPY_INT64","dgelsd"));
 #endif
 
+    LOCK_LAPACK_LITE;
     lapack_lite_status =
             FNAME(dgelsd)(&m,&n,&nrhs,DDATA(a),&lda,DDATA(b),&ldb,
                           DDATA(s),&rcond,&rank,DDATA(work),&lwork,
                           IDATA(iwork),&info);
+    UNLOCK_LAPACK_LITE;
     if (PyErr_Occurred()) {
         return NULL;
     }
@@ -185,9 +213,11 @@ lapack_lite_dgeqrf(PyObject *NPY_UNUSED(self), PyObject *args)
         TRY(check_object(tau,NPY_DOUBLE,"tau","NPY_DOUBLE","dgeqrf"));
         TRY(check_object(work,NPY_DOUBLE,"work","NPY_DOUBLE","dgeqrf"));
 
+        LOCK_LAPACK_LITE;
         lapack_lite_status =
                 FNAME(dgeqrf)(&m, &n, DDATA(a), &lda, DDATA(tau),
                               DDATA(work), &lwork, &info);
+        UNLOCK_LAPACK_LITE;
         if (PyErr_Occurred()) {
             return NULL;
         }
@@ -217,9 +247,11 @@ lapack_lite_dorgqr(PyObject *NPY_UNUSED(self), PyObject *args)
         TRY(check_object(a,NPY_DOUBLE,"a","NPY_DOUBLE","dorgqr"));
         TRY(check_object(tau,NPY_DOUBLE,"tau","NPY_DOUBLE","dorgqr"));
         TRY(check_object(work,NPY_DOUBLE,"work","NPY_DOUBLE","dorgqr"));
+        LOCK_LAPACK_LITE;
         lapack_lite_status =
             FNAME(dorgqr)(&m, &n, &k, DDATA(a), &lda, DDATA(tau), DDATA(work),
                           &lwork, &info);
+        UNLOCK_LAPACK_LITE;
         if (PyErr_Occurred()) {
             return NULL;
         }
@@ -266,9 +298,11 @@ lapack_lite_zgelsd(PyObject *NPY_UNUSED(self), PyObject *args)
     TRY(check_object(iwork,NPY_INT64,"iwork","NPY_INT64","zgelsd"));
 #endif
 
+    LOCK_LAPACK_LITE;
     lapack_lite_status =
         FNAME(zgelsd)(&m,&n,&nrhs,ZDATA(a),&lda,ZDATA(b),&ldb,DDATA(s),&rcond,
                       &rank,ZDATA(work),&lwork,DDATA(rwork),IDATA(iwork),&info);
+    UNLOCK_LAPACK_LITE;
     if (PyErr_Occurred()) {
         return NULL;
     }
@@ -301,9 +335,11 @@ lapack_lite_zgeqrf(PyObject *NPY_UNUSED(self), PyObject *args)
         TRY(check_object(tau,NPY_CDOUBLE,"tau","NPY_CDOUBLE","zgeqrf"));
         TRY(check_object(work,NPY_CDOUBLE,"work","NPY_CDOUBLE","zgeqrf"));
 
+        LOCK_LAPACK_LITE;
         lapack_lite_status =
             FNAME(zgeqrf)(&m, &n, ZDATA(a), &lda, ZDATA(tau), ZDATA(work),
                           &lwork, &info);
+        UNLOCK_LAPACK_LITE;
         if (PyErr_Occurred()) {
             return NULL;
         }
@@ -334,9 +370,11 @@ lapack_lite_zungqr(PyObject *NPY_UNUSED(self), PyObject *args)
         TRY(check_object(work,NPY_CDOUBLE,"work","NPY_CDOUBLE","zungqr"));
 
 
+        LOCK_LAPACK_LITE;
         lapack_lite_status =
             FNAME(zungqr)(&m, &n, &k, ZDATA(a), &lda, ZDATA(tau), ZDATA(work),
                           &lwork, &info);
+        UNLOCK_LAPACK_LITE;
         if (PyErr_Occurred()) {
             return NULL;
         }
@@ -354,7 +392,9 @@ lapack_lite_xerbla(PyObject *NPY_UNUSED(self), PyObject *args)
 
     NPY_BEGIN_THREADS_DEF;
     NPY_BEGIN_THREADS;
+    LOCK_LAPACK_LITE;
     FNAME(xerbla)("test", &info);
+    UNLOCK_LAPACK_LITE;
     NPY_END_THREADS;
 
     if (PyErr_Occurred()) {
@@ -365,7 +405,30 @@ lapack_lite_xerbla(PyObject *NPY_UNUSED(self), PyObject *args)
 
 
 #define STR(x) #x
-#define lameth(name) {STR(name), lapack_lite_##name, METH_VARARGS, NULL}
+/* The bound module owns every Python object and API table used by the call. */
+#define LAPACK_WRAPPER(name) \
+static PyObject *lapack_lite_owned_##name(PyObject *self, PyObject *args) \
+{ \
+    lapack_lite_state *state = PyModule_GetState(self); \
+    if (NPY_SI_Context_Check(&state->numpy) < 0) { \
+        return NULL; \
+    } \
+    lapack_lite_state *previous = lapack_lite_active; \
+    PyThreadState *previous_owner = npy_lapack_xerbla_set_owner(PyThreadState_Get()); \
+    lapack_lite_active = state; \
+    PyObject *result = lapack_lite_##name(self, args); \
+    lapack_lite_active = previous; \
+    npy_lapack_xerbla_set_owner(previous_owner); \
+    return result; \
+}
+LAPACK_WRAPPER(dgelsd)
+LAPACK_WRAPPER(dgeqrf)
+LAPACK_WRAPPER(dorgqr)
+LAPACK_WRAPPER(zgelsd)
+LAPACK_WRAPPER(zgeqrf)
+LAPACK_WRAPPER(zungqr)
+LAPACK_WRAPPER(xerbla)
+#define lameth(name) {STR(name), lapack_lite_owned_##name, METH_VARARGS, NULL}
 static struct PyMethodDef lapack_lite_module_methods[] = {
     lameth(dgelsd),
     lameth(dgeqrf),
@@ -377,42 +440,62 @@ static struct PyMethodDef lapack_lite_module_methods[] = {
     { NULL,NULL,0, NULL}
 };
 
-static int module_loaded = 0;
+static int
+lapack_lite_traverse(PyObject *m, visitproc visit, void *arg)
+{
+    lapack_lite_state *state = PyModule_GetState(m);
+    Py_VISIT(state->error);
+    return NPY_SI_Context_Traverse(&state->numpy, visit, arg);
+}
+
+static int
+lapack_lite_clear(PyObject *m)
+{
+    lapack_lite_state *state = PyModule_GetState(m);
+    Py_CLEAR(state->error);
+    NPY_SI_Context_Clear(&state->numpy);
+    return 0;
+}
+
+static void
+lapack_lite_free(void *m)
+{
+    lapack_lite_clear((PyObject *)m);
+}
 
 static int
 lapack_lite_exec(PyObject *m)
 {
-    PyObject *d;
-
-    // https://docs.python.org/3/howto/isolating-extensions.html#opt-out-limiting-to-one-module-object-per-process
-    if (module_loaded) {
-        PyErr_SetString(PyExc_ImportError,
-                        "cannot load module more than once per process");
+    lapack_lite_state *state = PyModule_GetState(m);
+    if (state->numpy.owner != NULL) {
+        return 0;
+    }
+    if (NPY_SI_Context_Import(&state->numpy) < 0) {
         return -1;
     }
-    module_loaded = 1;
-
-    if (PyArray_ImportNumPyAPI() < 0) {
+    lapack_lite_state *previous = lapack_lite_active;
+    lapack_lite_active = state;
+    state->runtime_version = (int)PyArray_GetNDArrayCFeatureVersion();
+    lapack_lite_active = previous;
+    state->error = PyErr_NewException("numpy.linalg.lapack_lite.LapackError", NULL, NULL);
+    if (state->error == NULL || PyModule_AddObjectRef(m, "LapackError", state->error) < 0) {
         return -1;
     }
-
-    d = PyModule_GetDict(m);
-    LapackError = PyErr_NewException("numpy.linalg.lapack_lite.LapackError", NULL, NULL);
-    PyDict_SetItemString(d, "LapackError", LapackError);
-
 #ifdef HAVE_BLAS_ILP64
-    PyDict_SetItemString(d, "_ilp64", Py_True);
+    return PyModule_AddObjectRef(m, "_ilp64", Py_True);
 #else
-    PyDict_SetItemString(d, "_ilp64", Py_False);
+    return PyModule_AddObjectRef(m, "_ilp64", Py_False);
 #endif
-
-    return 0;
 }
 
 static struct PyModuleDef_Slot lapack_lite_slots[] = {
     {Py_mod_exec, lapack_lite_exec},
 #if PY_VERSION_HEX >= 0x030c00f0  // Python 3.12+
+#if PY_VERSION_HEX >= 0x030f0000
+    {Py_mod_multiple_interpreters, Py_MOD_PER_INTERPRETER_GIL_SUPPORTED},
+#else
     {Py_mod_multiple_interpreters, Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED},
+#endif
 #endif
 #if PY_VERSION_HEX >= 0x030d00f0  // Python 3.13+
     // signal that this module supports running without an active GIL
@@ -424,9 +507,12 @@ static struct PyModuleDef_Slot lapack_lite_slots[] = {
 static struct PyModuleDef moduledef = {
     .m_base = PyModuleDef_HEAD_INIT,
     .m_name = "lapack_lite",
-    .m_size = 0,
+    .m_size = sizeof(lapack_lite_state),
     .m_methods = lapack_lite_module_methods,
     .m_slots = lapack_lite_slots,
+    .m_traverse = lapack_lite_traverse,
+    .m_clear = lapack_lite_clear,
+    .m_free = lapack_lite_free,
 };
 
 PyMODINIT_FUNC PyInit_lapack_lite(void) {

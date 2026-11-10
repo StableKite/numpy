@@ -27,11 +27,6 @@ simd__vector_item(PySIMDVectorObject *self, Py_ssize_t i)
     return simd_scalar_to_number(data, info->to_scalar);
 }
 
-static PySequenceMethods simd__vector_as_sequence = {
-    .sq_length = (lenfunc) simd__vector_length,
-    .sq_item = (ssizeargfunc) simd__vector_item
-};
-
 static PyObject *
 simd__vector_name(PySIMDVectorObject *self, void *NPY_UNUSED(ignored))
 {
@@ -72,15 +67,42 @@ simd__vector_compare(PyObject *self, PyObject *other, int cmp_op)
     }
     return obj;
 }
-static PyTypeObject PySIMDVectorType = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = NPY_TOSTRING(NPY_CPU_DISPATCH_CURFX(VECTOR)),
-    .tp_basicsize = sizeof(PySIMDVectorObject),
-    .tp_repr = (reprfunc)simd__vector_repr,
-    .tp_as_sequence = &simd__vector_as_sequence,
-    .tp_flags = Py_TPFLAGS_DEFAULT,
-    .tp_richcompare = simd__vector_compare,
-    .tp_getset = simd__vector_getset
+static int
+simd__vector_traverse(PySIMDVectorObject *self, visitproc visit, void *arg)
+{
+    Py_VISIT(Py_TYPE(self));
+    return 0;
+}
+static void
+simd__vector_dealloc(PySIMDVectorObject *self)
+{
+    PyObject_GC_UnTrack(self);
+    PyTypeObject *type = Py_TYPE(self);
+    PyObject_GC_Del(self);
+    Py_DECREF(type);
+}
+static PyObject *
+simd__vector_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
+{
+    PyErr_SetString(PyExc_TypeError, "SIMD vectors must be created by target intrinsics");
+    return NULL;
+}
+static PyType_Slot simd__vector_slots[] = {
+    {Py_tp_dealloc, simd__vector_dealloc},
+    {Py_tp_traverse, simd__vector_traverse},
+    {Py_tp_new, simd__vector_new},
+    {Py_tp_repr, simd__vector_repr},
+    {Py_tp_richcompare, simd__vector_compare},
+    {Py_tp_getset, simd__vector_getset},
+    {Py_sq_length, simd__vector_length},
+    {Py_sq_item, simd__vector_item},
+    {0, NULL}
+};
+static PyType_Spec simd__vector_spec = {
+    .name = "numpy._core._simd." NPY_TOSTRING(NPY_CPU_DISPATCH_CURFX(VECTOR)),
+    .basicsize = sizeof(PySIMDVectorObject),
+    .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
+    .slots = simd__vector_slots
 };
 
 /************************************
@@ -107,7 +129,7 @@ PySIMDVector_FromData(simd_data data, simd_data_type dtype)
     const simd_data_info *info = simd_data_getinfo(dtype);
     assert(info->is_vector && info->nlanes > 0);
 
-    PySIMDVectorObject *vec = PyObject_New(PySIMDVectorObject, &PySIMDVectorType);
+    PySIMDVectorObject *vec = PyObject_GC_New(PySIMDVectorObject, simd_active_state->vector_type);
     if (vec == NULL) {
         return (PySIMDVectorObject*)PyErr_NoMemory();
     }
@@ -130,6 +152,7 @@ PySIMDVector_FromData(simd_data data, simd_data_type dtype)
         }
     }
     npyv_store_u8(vec->data, data.vu8);
+    PyObject_GC_Track(vec);
     return vec;
 }
 
@@ -141,7 +164,7 @@ PySIMDVector_AsData(PySIMDVectorObject *vec, simd_data_type dtype)
 
     simd_data data = {.u64 = 0};
     if (!PyObject_IsInstance(
-        (PyObject *)vec, (PyObject *)&PySIMDVectorType
+        (PyObject *)vec, (PyObject *)simd_active_state->vector_type
     )) {
         PyErr_Format(PyExc_TypeError,
             "a vector type %s is required", info->pyname
@@ -180,14 +203,11 @@ PySIMDVector_AsData(PySIMDVectorObject *vec, simd_data_type dtype)
 static int
 PySIMDVectorType_Init(PyObject *module)
 {
-    Py_INCREF(&PySIMDVectorType);
-    if (PyType_Ready(&PySIMDVectorType)) {
+    simd_target_state *state = PyModule_GetState(module);
+    state->vector_type = (PyTypeObject *)PyType_FromModuleAndSpec(
+            module, &simd__vector_spec, NULL);
+    if (state->vector_type == NULL) {
         return -1;
     }
-    if (PyModule_AddObject(
-        module, "vector_type",(PyObject *)&PySIMDVectorType
-    )) {
-        return -1;
-    }
-    return 0;
+    return PyModule_AddObjectRef(module, "vector_type", (PyObject *)state->vector_type);
 }

@@ -186,8 +186,8 @@ initialize_keywords(const char *funcname,
     cache->npositional = npositional;
     cache->nrequired = nrequired;
 
-    /* NULL kw_strings for easier cleanup (and NULL termination) */
-    memset(cache->kw_strings, 0, sizeof(PyObject *) * (nkwargs + 1));
+    /* NULL terminate immutable C signature metadata. */
+    memset(cache->kw_names, 0, sizeof(char *) * (nkwargs + 1));
 
     for (int i = 0; i < nspecs; i++) {
         const char *name = specs[i].name;
@@ -197,21 +197,12 @@ initialize_keywords(const char *funcname,
         }
         if (i >= npositional_only) {
             int i_kwarg = i - npositional_only;
-            cache->kw_strings[i_kwarg] = PyUnicode_InternFromString(name);
-            if (cache->kw_strings[i_kwarg] == NULL) {
-                goto error;
-            }
+            cache->kw_names[i_kwarg] = name;
         }
     }
 
     return 0;
 
-error:
-    for (int i = 0; i < nkwargs; i++) {
-        Py_XDECREF(cache->kw_strings[i]);
-    }
-    cache->npositional = -1;  /* not initialized */
-    return -1;
 }
 
 
@@ -237,7 +228,7 @@ raise_incorrect_number_of_positional_args(const char *funcname,
 
 static void
 raise_missing_argument(const char *funcname,
-        const _NpyArgParserCache *cache, int i)
+        const _NpyArgParserCache *cache, PyObject *const *kw_strings, int i)
 {
     if (i < cache->npositional_only) {
         PyErr_Format(PyExc_TypeError,
@@ -245,7 +236,7 @@ raise_missing_argument(const char *funcname,
                 funcname, i);
     }
     else {
-        PyObject *kw = cache->kw_strings[i - cache->npositional_only];
+        PyObject *kw = kw_strings[i - cache->npositional_only];
         PyErr_Format(PyExc_TypeError,
                 "%s() missing required argument '%S' (pos %d)",
                 funcname, kw, i);
@@ -268,25 +259,12 @@ raise_missing_argument(const char *funcname,
  *
  * @return Returns 0 on success and -1 on failure.
  */
-NPY_NO_EXPORT int
-_npy_parse_arguments(const char *funcname,
-        _NpyArgParserCache *cache,
+static int
+parse_arguments_with_owned_keywords(const char *funcname,
+        const _NpyArgParserCache *cache, PyObject *const *kw_strings,
         PyObject *const *args, Py_ssize_t len_args, PyObject *kwnames,
-        npy_arg_spec *specs, int nspecs)
+        npy_arg_spec *specs)
 {
-    if (!atomic_load_explicit((_Atomic(uint8_t) *)&cache->initialized, memory_order_acquire)) {
-        LOCK_ARGPARSE_MUTEX;
-        if (!atomic_load_explicit((_Atomic(uint8_t) *)&cache->initialized, memory_order_acquire)) {
-            int res = initialize_keywords(funcname, cache, specs, nspecs);
-            if (res < 0) {
-                UNLOCK_ARGPARSE_MUTEX;
-                return -1;
-            }
-            atomic_store_explicit((_Atomic(uint8_t) *)&cache->initialized, 1, memory_order_release);
-        }
-        UNLOCK_ARGPARSE_MUTEX;
-    }
-
     if (NPY_UNLIKELY(len_args > cache->npositional)) {
         return raise_incorrect_number_of_positional_args(
                 funcname, cache, len_args);
@@ -318,14 +296,14 @@ _npy_parse_arguments(const char *funcname,
             PyObject *const *name;
 
             /* Super-fast path, check identity: */
-            for (name = cache->kw_strings; *name != NULL; name++) {
+            for (name = kw_strings; *name != NULL; name++) {
                 if (*name == key) {
                     break;
                 }
             }
             if (NPY_UNLIKELY(*name == NULL)) {
                 /* Slow fallback, if identity checks failed for some reason */
-                for (name = cache->kw_strings; *name != NULL; name++) {
+                for (name = kw_strings; *name != NULL; name++) {
                     int eq = PyObject_RichCompareBool(*name, key, Py_EQ);
                     if (eq == -1) {
                         return -1;
@@ -344,7 +322,7 @@ _npy_parse_arguments(const char *funcname,
             }
 
              Py_ssize_t param_pos = (
-                    (name - cache->kw_strings) + cache->npositional_only);
+                    (name - kw_strings) + cache->npositional_only);
 
             /* There could be an identical positional argument */
             if (NPY_UNLIKELY(all_arguments[param_pos] != NULL)) {
@@ -400,16 +378,59 @@ _npy_parse_arguments(const char *funcname,
     if (NPY_UNLIKELY(len_args < cache->nrequired)) {
         /* (PyArg_* also does this after the actual parsing is finished) */
         if (NPY_UNLIKELY(max_nargs < cache->nrequired)) {
-            raise_missing_argument(funcname, cache, max_nargs);
+            raise_missing_argument(funcname, cache, kw_strings, max_nargs);
             return -1;
         }
         for (int i = 0; i < cache->nrequired; i++) {
             if (NPY_UNLIKELY(all_arguments[i] == NULL)) {
-                raise_missing_argument(funcname, cache, i);
+                raise_missing_argument(funcname, cache, kw_strings, i);
                 return -1;
             }
         }
     }
 
     return 0;
+}
+
+
+NPY_NO_EXPORT int
+_npy_parse_arguments(const char *funcname,
+        _NpyArgParserCache *cache,
+        PyObject *const *args, Py_ssize_t len_args, PyObject *kwnames,
+        npy_arg_spec *specs, int nspecs)
+{
+    if (!atomic_load_explicit((_Atomic(uint8_t) *)&cache->initialized, memory_order_acquire)) {
+        LOCK_ARGPARSE_MUTEX;
+        if (!atomic_load_explicit((_Atomic(uint8_t) *)&cache->initialized, memory_order_acquire)) {
+            int res = initialize_keywords(funcname, cache, specs, nspecs);
+            if (res < 0) {
+                UNLOCK_ARGPARSE_MUTEX;
+                return -1;
+            }
+            atomic_store_explicit((_Atomic(uint8_t) *)&cache->initialized, 1, memory_order_release);
+        }
+        UNLOCK_ARGPARSE_MUTEX;
+    }
+
+    /* Intern only in the current interpreter and own all temporary refs
+     * until converters and any reentrant Python calls have returned. */
+    PyObject *kw_strings[_NPY_MAX_KWARGS+1] = {NULL};
+    int count = 0;
+    if (kwnames != NULL || len_args < cache->nrequired) {
+        for (; cache->kw_names[count] != NULL; count++) {
+            kw_strings[count] = PyUnicode_InternFromString(cache->kw_names[count]);
+            if (kw_strings[count] == NULL) {
+                for (int i = 0; i < count; i++) {
+                    Py_DECREF(kw_strings[i]);
+                }
+                return -1;
+            }
+        }
+    }
+    int result = parse_arguments_with_owned_keywords(funcname, cache,
+            kw_strings, args, len_args, kwnames, specs);
+    for (int i = 0; i < count; i++) {
+        Py_DECREF(kw_strings[i]);
+    }
+    return result;
 }

@@ -78,7 +78,12 @@ dtypemeta_dealloc(PyArray_DTypeMeta *self) {
     PyObject_GC_UnTrack(self);
 
     dtypemeta_clear_owned_fields(self);
+    self->dt_slots = NULL;
     PyMem_Free(dt_slots);
+    /* type_dealloc untracks its argument itself. Match subtype_dealloc's
+     * handoff contract after our own protected field cleanup; otherwise a
+     * GIL build unlinks the same GC list node twice. */
+    PyObject_GC_Track(self);
     PyType_Type.tp_dealloc((PyObject *) self);
     /* type_dealloc handles its payload but assumes the builtin metaclass. */
     if (heap_metaclass) {
@@ -283,6 +288,7 @@ dtypemeta_initialize_struct_from_spec(
         /* Initialize full legacy ArrFuncs from the descriptor prototype. */
         if (legacy_proto->f != NULL) {
             NPY_DT_SLOTS(DType)->f = *(legacy_proto->f);
+            Py_XINCREF(NPY_DT_SLOTS(DType)->f.castdict);
             if (NPY_DT_SLOTS(DType)->f.copyswapn == NULL
                     && NPY_DT_SLOTS(DType)->f.copyswap != NULL) {
                 NPY_DT_SLOTS(DType)->f.copyswapn = _default_copyswapn;
@@ -451,7 +457,8 @@ dtypemeta_initialize_struct_from_spec(
         descr->type_num = typenum;
         legacy_proto->type_num = typenum;
         DType->type_num = typenum;
-        DType->singleton = (PyArray_Descr *)descr;
+        /* Registry and heap DType independently own this descriptor. */
+        DType->singleton = (PyArray_Descr *)Py_NewRef(descr);
     }
     else {
         /* invalid type num. Ideally, we get away with it! */
@@ -466,13 +473,11 @@ dtypemeta_initialize_struct_from_spec(
     if (PyType_GetFlags(spec->typeobj) & Py_TPFLAGS_HEAPTYPE) {
         if (PyObject_SetAttrString((PyObject *)DType->scalar_type,
                 "__associated_array_dtype__", (PyObject *)DType) < 0) {
-            Py_DECREF(DType);
             return -1;
         }
     }
     if (_PyArray_MapPyTypeToDType(DType, DType->scalar_type,
             legacy_proto != NULL) < 0) {
-        Py_DECREF(DType);
         return -1;
     }
 

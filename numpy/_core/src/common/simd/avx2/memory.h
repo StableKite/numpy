@@ -3,6 +3,7 @@
 #endif
 
 #include "misc.h"
+#include <string.h>
 
 #ifndef _NPY_SIMD_AVX2_MEMORY_H
 #define _NPY_SIMD_AVX2_MEMORY_H
@@ -26,7 +27,7 @@
     NPY_FINLINE void npyv_stores_##SFX(CTYPE *ptr, npyv_##SFX vec)           \
     { _mm256_stream_si256((__m256i*)ptr, vec); }                             \
     NPY_FINLINE void npyv_storel_##SFX(CTYPE *ptr, npyv_##SFX vec)           \
-    { _mm_storeu_si128((__m128i*)(ptr), _mm256_castsi256_si128(vec)); }      \
+    { memcpy(ptr, &vec, 16); }      \
     NPY_FINLINE void npyv_storeh_##SFX(CTYPE *ptr, npyv_##SFX vec)           \
     { _mm_storeu_si128((__m128i*)(ptr), _mm256_extracti128_si256(vec, 1)); }
 

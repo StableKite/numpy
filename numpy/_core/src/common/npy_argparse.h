@@ -36,8 +36,9 @@ typedef struct {
     int npositional_only;
     int nrequired;
     npy_uint8 initialized;
-    /* Null terminated list of keyword argument name strings */
-    PyObject *kw_strings[_NPY_MAX_KWARGS+1];
+    /* Keyword names in persistent function signatures are static ASCII C
+     * literals. Shared caches keep only C metadata, never Python objects. */
+    const char *kw_names[_NPY_MAX_KWARGS+1];
 } _NpyArgParserCache;
 
 NPY_NO_EXPORT int init_argparse_mutex(void);

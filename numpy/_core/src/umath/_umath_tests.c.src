@@ -14,6 +14,7 @@
 #endif
 // for add_INT32_negative_indexed
 #define NPY_TARGET_VERSION NPY_2_1_API_VERSION
+#include "src/umath/_owned_test_context.h"
 #include "numpy/arrayobject.h"
 #include "numpy/ufuncobject.h"
 #include "numpy/ndarrayobject.h"
@@ -27,6 +28,7 @@
 #include "numpy/npy_cpu.h"
 #include "npy_import.h"
 #include "numpy/dtype_api.h"
+#include "src/umath/_owned_legacy_test_loop.h"
 
 /*
  *****************************************************************************
@@ -74,10 +76,23 @@ always_error_loop(
         char **NPY_UNUSED(args), npy_intp const *NPY_UNUSED(dimensions),
         npy_intp const *NPY_UNUSED(steps), void *NPY_UNUSED(func))
 {
+#if PY_VERSION_HEX >= 0x030d0000
+    PyThreadState *attached = PyThreadState_GetUnchecked();
+    if (attached == NULL) {
+        assert(owned_legacy_test_caller != NULL);
+        PyEval_RestoreThread(owned_legacy_test_caller);
+    }
+    PyErr_SetString(PyExc_RuntimeError, "How unexpected :)!");
+    if (attached == NULL) {
+        PyThreadState *owner = PyEval_SaveThread();
+        assert(owner == owned_legacy_test_caller);
+    }
+#else
     NPY_ALLOW_C_API_DEF
     NPY_ALLOW_C_API;
     PyErr_SetString(PyExc_RuntimeError, "How unexpected :)!");
     NPY_DISABLE_C_API;
+#endif
     return;
 }
 
@@ -458,6 +473,10 @@ addUfuncs(PyObject *dictionary) {
     if (f == NULL) {
         return -1;
     }
+    if (owned_legacy_test_install((PyUFuncObject *)f) < 0) {
+        Py_DECREF(f);
+        return -1;
+    }
     PyDict_SetItemString(dictionary, "always_error", f);
     Py_DECREF(f);
     f = PyUFunc_FromFuncAndData(always_error_functions, always_error_data,
@@ -465,6 +484,10 @@ addUfuncs(PyObject *dictionary) {
             "simply, broken, ufunc that sets an error (but releases the GIL).",
             0);
     if (f == NULL) {
+        return -1;
+    }
+    if (owned_legacy_test_install((PyUFuncObject *)f) < 0) {
+        Py_DECREF(f);
         return -1;
     }
     PyDict_SetItemString(dictionary, "always_error_unary", f);
@@ -475,6 +498,10 @@ addUfuncs(PyObject *dictionary) {
             "simply, broken, gufunc that sets an error (but releases the GIL).",
             0, "(i),()->()");
     if (f == NULL) {
+        return -1;
+    }
+    if (owned_legacy_test_install((PyUFuncObject *)f) < 0) {
+        Py_DECREF(f);
         return -1;
     }
     PyDict_SetItemString(dictionary, "always_error_gufunc", f);
@@ -923,56 +950,88 @@ UMath_Tests_restore_loop(PyObject *NPY_UNUSED(dummy), PyObject *args)
     Py_RETURN_NONE;
 }
 
+static PyObject *
+owned_test_signature(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = UMath_Tests_test_signature(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+static PyObject *
+owned_test_dispatch(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = UMath_Tests_test_dispatch(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+static PyObject *
+owned_replace_loop(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = UMath_Tests_replace_loop(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
+static PyObject *
+owned_restore_loop(PyObject *self, PyObject *args)
+{
+    owned_test_state *state = PyModule_GetState(self);
+    if (NPY_SI_Context_Check(&state->numpy) < 0) {
+        return NULL;
+    }
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    PyObject *result = UMath_Tests_restore_loop(self, args);
+    owned_test_active = previous;
+    return result;
+}
+
 static PyMethodDef UMath_TestsMethods[] = {
-    {"test_signature",  UMath_Tests_test_signature, METH_VARARGS,
+    {"test_signature",  owned_test_signature, METH_VARARGS,
      "Test signature parsing of ufunc. \n"
      "Arguments: nin nout signature \n"
      "If fails, it returns NULL. Otherwise it returns a tuple of ufunc "
      "internals. \n",
      },
-    {"test_dispatch", UMath_Tests_test_dispatch, METH_NOARGS, NULL},
-    {"replace_loop", UMath_Tests_replace_loop, METH_VARARGS,
+    {"test_dispatch", owned_test_dispatch, METH_NOARGS, NULL},
+    {"replace_loop", owned_replace_loop, METH_VARARGS,
      "Replace the float64 loop of a ufunc with one that outputs 42.0.\n"
      "Returns a capsule holding the old loop for restore_loop().\n"},
-    {"restore_loop", UMath_Tests_restore_loop, METH_VARARGS,
+    {"restore_loop", owned_restore_loop, METH_VARARGS,
      "Restore a ufunc loop previously replaced by replace_loop().\n"
      "Arguments: ufunc, capsule\n"},
     {NULL, NULL, 0, NULL}        /* Sentinel */
 };
 
-static struct PyModuleDef moduledef = {
-        PyModuleDef_HEAD_INIT,
-        "_umath_tests",
-        NULL,
-        -1,
-        UMath_TestsMethods,
-        NULL,
-        NULL,
-        NULL,
-        NULL
-};
-
-/* Initialization function for the module */
-PyMODINIT_FUNC PyInit__umath_tests(void) {
-    PyObject *m;
+static int
+initialize_umath_tests(PyObject *m)
+{
     PyObject *d;
     PyObject *version;
 
     // Initialize CPU features
     if (npy_cpu_init() < 0) {
-        return NULL;
-    }
-
-    m = PyModule_Create(&moduledef);
-    if (m == NULL) {
-        return NULL;
-    }
-
-    if (PyArray_ImportNumPyAPI() < 0) {
-        return NULL;
-    }
-    if (PyUFunc_ImportUFuncAPI() < 0) {
-        return NULL;
+        return -1;
     }
 
     d = PyModule_GetDict(m);
@@ -983,19 +1042,17 @@ PyMODINIT_FUNC PyInit__umath_tests(void) {
 
     /* Load the ufunc operators into the module's namespace */
     if (addUfuncs(d) < 0) {
-        Py_DECREF(m);
         PyErr_Print();
         PyErr_SetString(PyExc_RuntimeError,
                         "cannot load _umath_tests module.");
-        return NULL;
+        return -1;
     }
 
     if (add_INT32_negative_indexed(m, d) < 0) {
-        Py_DECREF(m);
         PyErr_Print();
         PyErr_SetString(PyExc_RuntimeError,
                         "cannot load _umath_tests module.");
-        return NULL;
+        return -1;
     }
 
     // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -1011,24 +1068,57 @@ PyMODINIT_FUNC PyInit__umath_tests(void) {
                                 "convolution of x and y ('full' mode)",
                                 0, "(m),(n)->(p)");
     if (gufunc == NULL) {
-        Py_DECREF(m);
-        return NULL;
+        return -1;
     }
     gufunc->process_core_dims_func = &conv1d_full_process_core_dims;
 
     int status = PyModule_AddObject(m, "conv1d_full", (PyObject *) gufunc);
     if (status == -1) {
         Py_DECREF(gufunc);
-        Py_DECREF(m);
-        return NULL;
+        return -1;
     }
 
     // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
-#ifdef Py_GIL_DISABLED
-    // signal this module supports running with the GIL disabled
-    PyUnstable_Module_SetGIL(m, Py_MOD_GIL_NOT_USED);
-#endif
+    return 0;
+}
 
-    return m;
+static int
+owned_umath_exec(PyObject *module)
+{
+    if (owned_test_initialize(module) < 0) {
+        return -1;
+    }
+    owned_test_state *state = PyModule_GetState(module);
+    owned_test_state *previous = owned_test_active;
+    owned_test_active = state;
+    int result = initialize_umath_tests(module);
+    owned_test_active = previous;
+    return result;
+}
+static PyModuleDef_Slot owned_umath_slots[] = {
+    {Py_mod_exec, owned_umath_exec},
+#if PY_VERSION_HEX >= 0x030f0000
+    {Py_mod_multiple_interpreters, Py_MOD_PER_INTERPRETER_GIL_SUPPORTED},
+#elif PY_VERSION_HEX >= 0x030c0000
+    {Py_mod_multiple_interpreters, Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED},
+#endif
+#if PY_VERSION_HEX >= 0x030d0000
+    {Py_mod_gil, Py_MOD_GIL_NOT_USED},
+#endif
+    {0, NULL}
+};
+static struct PyModuleDef moduledef = {
+    .m_base = PyModuleDef_HEAD_INIT,
+    .m_name = "_umath_tests",
+    .m_size = sizeof(owned_test_state),
+    .m_methods = UMath_TestsMethods,
+    .m_slots = owned_umath_slots,
+    .m_traverse = owned_test_traverse,
+    .m_clear = owned_test_clear,
+    .m_free = owned_test_free
+};
+PyMODINIT_FUNC PyInit__umath_tests(void)
+{
+    return PyModuleDef_Init(&moduledef);
 }

@@ -19,6 +19,7 @@
 #include "npy_config.h"
 
 #include "npy_cblas.h"
+#include "lapack_lite/python_xerbla.h"
 
 #include <cstddef>
 #include <cstdio>
@@ -4760,11 +4761,13 @@ owned_linalg_loop(PyArrayMethod_Context *context, char *const *args,
     auto function = ufunc->functions[selected];
     void *data = ufunc->data == NULL ? NULL : ufunc->data[selected];
     PyThreadState *previous = linalg_error_caller;
+    PyThreadState *previous_xerbla = npy_lapack_xerbla_set_owner(PyThreadState_Get());
     PyThreadState *caller = PyEval_SaveThread();
     linalg_error_caller = caller;
     function(const_cast<char **>(args), dimensions, strides, data);
     linalg_error_caller = previous;
     PyEval_RestoreThread(caller);
+    npy_lapack_xerbla_set_owner(previous_xerbla);
     return PyErr_Occurred() == NULL ? 0 : -1;
 }
 

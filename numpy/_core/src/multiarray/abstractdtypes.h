@@ -39,7 +39,8 @@ initialize_abstract_dtypes(PyObject *module);
  * @param obj The original Python object.
  * @param arr The array into which the Python object was converted.
  * @param[in,out] **dtype A pointer to the array's DType, if not NULL it will be
- *        replaced with the abstract DType.
+ *        replaced with the abstract DType.  The pointer must own a
+ *        reference, which is released when the DType is replaced.
  * @return 0 if the `obj` was not a python scalar, and 1 if it was.
  */
 static inline int
