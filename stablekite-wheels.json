@@ -1,6 +1,69 @@
 {
   "schema_version": 1,
   "version": "2.5.4+stablekite.2",
-  "native_source_commit": "PENDING_ACTUAL_SOURCE_BUILD",
-  "artifacts": {}
+  "native_source_commit": "f6155f5a8613efc32f1b292af7733e850c035211",
+  "native_implementation_commit": "f6155f5a8613efc32f1b292af7733e850c035211",
+  "actual_upstream_release_commit": "a3d0ef1df045b858e68115001fdabc930bb3b68c",
+  "release_tag": "cp315t-si-254-stablekite2-20261110-1",
+  "artifacts": {
+    "win_amd64": {
+      "filename": "numpy-2.5.4+stablekite.2-cp315-cp315t-win_amd64.whl",
+      "url": "https://github.com/StableKite/numpy/releases/download/cp315t-si-254-stablekite2-20261110-1/numpy-2.5.4+stablekite.2-cp315-cp315t-win_amd64.whl",
+      "sha256": "7d6686a065433c550079ecb89d414cd8d3ec87d093967b9dfcd936d110beb6c0",
+      "size": 6962777,
+      "tag": "cp315-cp315t-win_amd64",
+      "native_hashes": {
+        "numpy/_core/_multiarray_tests.cp315t-win_amd64.pyd": "eaf3040c893b363160acb1bf5073f8b88c17bcea599007507178a6745505bafb",
+        "numpy/_core/_umath_tests.cp315t-win_amd64.pyd": "013d56a7675a49ee20b2c60b823e87c9e1e770e3a6838dd99fc4b3fb046db08f",
+        "numpy/_core/_rational_tests.cp315t-win_amd64.pyd": "de495dcb185344f71804571c571bb5536e300d7b224fc85ca5404a85a56a1eab",
+        "numpy/_core/_struct_ufunc_tests.cp315t-win_amd64.pyd": "9f273935e7becf40d9983e9e15fe00751e9bf86b397ea8abf4b602aacc585d01",
+        "numpy/_core/_operand_flag_tests.cp315t-win_amd64.pyd": "9391d849ef993f24e78b701d7facf068f2db1740bdec6fa060583d0175a9af23",
+        "numpy/_core/_multiarray_umath.cp315t-win_amd64.pyd": "638d7aa20ced3d2e45a9ca2c6ca0aa0ed7bb9a520f42bb401dd808ba875c9a32",
+        "numpy/_core/_simd.cp315t-win_amd64.pyd": "4ac4771f449e8880b728960605a1dcb282b04ac448b2add962f04607b1e56255",
+        "numpy/fft/_pocketfft_umath.cp315t-win_amd64.pyd": "8a01e1727a39cbf86104522ccf8b850b937fa4e671ca0dd5954fa7c38302ac6b",
+        "numpy/linalg/lapack_lite.cp315t-win_amd64.pyd": "ff519a51bfde4a4db30b3180644d8fd81c629be92779dc28cd60a12c0a97148d",
+        "numpy/linalg/_umath_linalg.cp315t-win_amd64.pyd": "540f39db2d9019323047ab5c549ae724bcf081b1658c4064dce7040fef7dcda6",
+        "numpy/random/_bounded_integers.cp315t-win_amd64.pyd": "c547afb1269670e5be36527903316785f9f56a512d3ced10e36c481bc22e551b",
+        "numpy/random/_common.cp315t-win_amd64.pyd": "07f6666ca4077c99010d5afc4b1c64dd48c6dfd1b11a44434c4dc30c8baf0c99",
+        "numpy/random/_mt19937.cp315t-win_amd64.pyd": "b5fef90fddff7ea5eb45ef1665671ba5fe2a557a40f2c9fa9ee8328c7b98327f",
+        "numpy/random/_philox.cp315t-win_amd64.pyd": "2ca368d888bd2dd6e288de5d3518c40034d2991e061a83ea2f1884d016354fda",
+        "numpy/random/_pcg64.cp315t-win_amd64.pyd": "57dfc9a708e46cc978e7b81604e6f45f07c219545463070dabb8f768028a60ee",
+        "numpy/random/_sfc64.cp315t-win_amd64.pyd": "442f361718d730572c629c05f191c2d5a3fc5ae40ddfda7438e264cd8c369236",
+        "numpy/random/bit_generator.cp315t-win_amd64.pyd": "696da4fd56fce7a3c923354cc54439c8937908b2bfb3c83cc1f2e59fcc4e73c6",
+        "numpy/random/_generator.cp315t-win_amd64.pyd": "947fb4e799610f0bf1a891fae5ccd40623b3ee249dfbedc122b2500b217dadfd",
+        "numpy/random/mtrand.cp315t-win_amd64.pyd": "7d49fa2a4f63b50f3d2ca813c038d97a3370ec85f16d5c8eb33386b59635e3fb"
+      }
+    },
+    "linux_x86_64_glibc": {
+      "filename": "numpy-2.5.4+stablekite.2-cp315-cp315t-linux_x86_64.whl",
+      "url": "https://github.com/StableKite/numpy/releases/download/cp315t-si-254-stablekite2-20261110-1/numpy-2.5.4+stablekite.2-cp315-cp315t-linux_x86_64.whl",
+      "sha256": "46e295b4084799d97d9eaef39babce668ca2dd3e62c4611d33b36dcd861aed8e",
+      "size": 10519197,
+      "tag": "cp315-cp315t-linux_x86_64",
+      "native_hashes": {
+        "numpy/_core/_multiarray_tests.cpython-315t-x86_64-linux-gnu.so": "9cb58ad04ae1f364f7a38b9f4cac47d637e6eab70d2ce1c686fe58bef8b41c0a",
+        "numpy/_core/_umath_tests.cpython-315t-x86_64-linux-gnu.so": "c24fdf74420d73e4ad1a3acdb735dd1e5879a85f868870e77fe469de79d6ebaa",
+        "numpy/_core/_rational_tests.cpython-315t-x86_64-linux-gnu.so": "57537e705837a3b8b1e9f39e4ec9c1bbb25da41a9e79ad66781da5a357f6f177",
+        "numpy/_core/_struct_ufunc_tests.cpython-315t-x86_64-linux-gnu.so": "58b562c5c0a9b03877b65d610b4e4200573ffd3b03e97b2589efc852b8fe7c35",
+        "numpy/_core/_operand_flag_tests.cpython-315t-x86_64-linux-gnu.so": "d262f483b8dfb27348a4e669db41dac783a5c72a2aba6f4fa1afdee4871cea2d",
+        "numpy/_core/_multiarray_umath.cpython-315t-x86_64-linux-gnu.so": "03e39c568aaf78b9b740205b61f17bcf6d8890737af607a904ee59beb029ab1f",
+        "numpy/_core/_simd.cpython-315t-x86_64-linux-gnu.so": "aae3320c1fb4cea383f2b0ba850749da484115aac95921309ef23a6c011e9f56",
+        "numpy/fft/_pocketfft_umath.cpython-315t-x86_64-linux-gnu.so": "6e6c1a7511283033b042478eff50c8a298b8b658898e9723599d6e6d25bc82b0",
+        "numpy/linalg/lapack_lite.cpython-315t-x86_64-linux-gnu.so": "722b598f9360894999a20dc96e14e0f3c556945f64478f48696e4a9f63ce3dab",
+        "numpy/linalg/_umath_linalg.cpython-315t-x86_64-linux-gnu.so": "0d04abf3ad93b259ccd0e59f572bb30a06351cb979174c474d62737748c5ea6f",
+        "numpy/random/_bounded_integers.cpython-315t-x86_64-linux-gnu.so": "335c9d2232745456b2f0a98cddef5d6e3b12e88359a4d66137ab9a496b96883a",
+        "numpy/random/_common.cpython-315t-x86_64-linux-gnu.so": "87ee5ffe32cb1946c9f6ea43c5dfdc7e150bc772816b0e2d1ccf4f057374cbb3",
+        "numpy/random/_mt19937.cpython-315t-x86_64-linux-gnu.so": "72ed9b48ea278f90e46237a43a1b462710fda767460a4549688046d6943bf5d3",
+        "numpy/random/_philox.cpython-315t-x86_64-linux-gnu.so": "3018d01af2298f09307dc9685a1463d926ed7e5858af741a6a5e47516256ba2f",
+        "numpy/random/_pcg64.cpython-315t-x86_64-linux-gnu.so": "c1f00954d6097e27cd10f34795f9f41669f8e85658e8aa28b819e50e64b5e2fa",
+        "numpy/random/_sfc64.cpython-315t-x86_64-linux-gnu.so": "ece09d068c396dbfda0926983603b9eca0dfbf3ca68cfedb521b9fc545391b97",
+        "numpy/random/bit_generator.cpython-315t-x86_64-linux-gnu.so": "1bdbf95aa2246e7d99bf3421a39f80c3d349e949a6615c81fd65cf5537f67d17",
+        "numpy/random/_generator.cpython-315t-x86_64-linux-gnu.so": "e446477bae5d7b7301ff0895e6dd60705fbbc4e8b5d143a59a974198e22e3ccc",
+        "numpy/random/mtrand.cpython-315t-x86_64-linux-gnu.so": "827a0448b5c4a23af2067ef40b557321748f85e81b53a3854491d3a12b8cf13a"
+      },
+      "minimum_glibc": "2.38",
+      "required_glibcxx": "3.4.29",
+      "required_cxxabi": "1.3.9"
+    }
+  }
 }
